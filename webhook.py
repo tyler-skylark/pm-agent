@@ -1,110 +1,135 @@
 #!/usr/bin/env python3
 """
-PM Watch Slack webhook — handles slash commands and DMs.
-Deploy as a Cloud Run Service (always-on HTTP server).
+PM Watch Slack webhook
+Handles /pmwatch slash command and DMs.
 """
 
 import hashlib
 import hmac
 import json
 import os
+import re
 import threading
 import time
-import urllib.parse
 import urllib.request
-from datetime import datetime
 
 from flask import Flask, request, jsonify
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 
-from agent import load_env, load_secrets_from_gcp, run_analysis, post_to_slack
+from agent import (
+    load_env, load_secrets_from_gcp,
+    run_analysis, run_briefing, run_deep_dive,
+    post_alerts_to_slack, post_freeform_to_slack,
+)
 
 app = Flask(__name__)
 
 
 def verify_slack_signature(req):
-    slack_signing_secret = os.environ.get("SLACK_SIGNING_SECRET", "")
-    if not slack_signing_secret:
-        return True  # skip verification if not configured
-
-    timestamp = req.headers.get("X-Slack-Request-Timestamp", "")
-    if abs(time.time() - int(timestamp)) > 300:
+    secret = os.environ.get("SLACK_SIGNING_SECRET", "")
+    if not secret:
+        return True
+    ts = req.headers.get("X-Slack-Request-Timestamp", "")
+    if not ts or abs(time.time() - int(ts)) > 300:
         return False
-
-    sig_basestring = f"v0:{timestamp}:{req.get_data(as_text=True)}"
-    expected = "v0=" + hmac.new(
-        slack_signing_secret.encode(),
-        sig_basestring.encode(),
-        hashlib.sha256,
-    ).hexdigest()
+    sig_base = f"v0:{ts}:{req.get_data(as_text=True)}"
+    expected = "v0=" + hmac.new(secret.encode(), sig_base.encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, req.headers.get("X-Slack-Signature", ""))
 
 
-def post_to_response_url(response_url, blocks, text):
+def post_to_response_url(response_url, text, blocks=None):
     payload = json.dumps({
         "response_type": "in_channel",
         "text": text,
-        "blocks": blocks,
+        **({"blocks": blocks} if blocks else {}),
     }).encode()
     req = urllib.request.Request(
-        response_url,
-        data=payload,
-        method="POST",
+        response_url, data=payload, method="POST",
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as e:
+        print(f"Error posting to response_url: {e}")
 
 
-def run_and_respond(response_url, channel_id):
-    """Run analysis in background thread, post results to Slack."""
+def handle_analysis(response_url, channel_id):
     try:
         alerts = run_analysis(on_demand=True)
         slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
-        now = datetime.now().strftime("%b %d, %I:%M %p")
-
         if alerts:
-            severity_emoji = {
-                "high": ":red_circle:",
-                "medium": ":large_yellow_circle:",
-                "low": ":large_blue_circle:",
-            }
-            blocks = [
-                {"type": "header", "text": {"type": "plain_text", "text": f"PM Watch (on-demand)  —  {now}"}},
-                {"type": "divider"},
-            ]
-            for alert in alerts:
-                emoji = severity_emoji.get(alert.get("severity", "low"), ":large_blue_circle:")
-                project_line = f"\n_Project: {alert['project']}_" if alert.get("project") else ""
-                text = f"{emoji}  *{alert['category']}*{project_line}\n{alert['description']}"
-                section = {"type": "section", "text": {"type": "mrkdwn", "text": text}}
-                if alert.get("url"):
-                    section["accessory"] = {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Open in Basecamp"},
-                        "url": alert["url"],
-                    }
-                blocks.append(section)
-                blocks.append({"type": "divider"})
-
-            summary = f"Found {len(alerts)} item(s) needing attention."
+            post_alerts_to_slack(slack_client, channel_id, alerts, title="PM Watch (on-demand)")
+            if response_url:
+                post_to_response_url(response_url, f"Found {len(alerts)} item(s) — posted above.")
         else:
-            blocks = [
-                {"type": "section", "text": {"type": "mrkdwn", "text": f":white_check_mark:  *All clear as of {now}*\nNo issues found across active Skylark projects."}},
-            ]
-            summary = "All clear — no issues found."
-
-        if response_url:
-            post_to_response_url(response_url, blocks, summary)
-        else:
-            slack_client.chat_postMessage(channel=channel_id, blocks=blocks, text=summary)
-
+            msg = ":white_check_mark:  *All clear* — no issues found across active Skylark projects."
+            if response_url:
+                post_to_response_url(response_url, msg,
+                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": msg}}])
+            else:
+                post_freeform_to_slack(slack_client, channel_id, msg)
     except Exception as e:
-        error_msg = f":warning: PM Watch error: {e}"
+        err = f":warning: PM Watch error: {e}"
         if response_url:
-            post_to_response_url(response_url, [], error_msg)
-        print(f"Error in run_and_respond: {e}")
+            post_to_response_url(response_url, err)
+        print(f"handle_analysis error: {e}")
+
+
+def handle_briefing(response_url, channel_id):
+    try:
+        text = run_briefing()
+        slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
+        post_freeform_to_slack(slack_client, channel_id, text, "Skylark PM Briefing")
+        if response_url:
+            post_to_response_url(response_url, "Briefing posted above.")
+    except Exception as e:
+        if response_url:
+            post_to_response_url(response_url, f":warning: Briefing error: {e}")
+        print(f"handle_briefing error: {e}")
+
+
+def handle_deep_dive(response_url, channel_id, project_query):
+    try:
+        text = run_deep_dive(project_query)
+        slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
+        post_freeform_to_slack(slack_client, channel_id, text, f"Deep dive: {project_query}")
+        if response_url:
+            post_to_response_url(response_url, "Deep dive posted above.")
+    except Exception as e:
+        if response_url:
+            post_to_response_url(response_url, f":warning: Deep dive error: {e}")
+        print(f"handle_deep_dive error: {e}")
+
+
+def parse_command(text):
+    """
+    Parse slash command text. Returns (mode, project_query).
+    Examples:
+      ""              → ("analysis", None)
+      "SKY-2446"      → ("deep_dive", "SKY-2446")
+      "status 2446"   → ("deep_dive", "SKY-2446")
+      "briefing"      → ("briefing", None)
+      "morning"       → ("briefing", None)
+    """
+    text = (text or "").strip().upper()
+
+    if not text or text in ("CHECK", "RUN", "UPDATE", "STATUS"):
+        return "analysis", None
+
+    if text in ("BRIEFING", "MORNING", "SUMMARY", "REPORT"):
+        return "briefing", None
+
+    # Match SKY-XXXX explicitly or just digits
+    match = re.search(r'SKY-(\d+)', text)
+    if not match:
+        match = re.search(r'\b(\d{4,})\b', text)
+        if match:
+            return "deep_dive", f"SKY-{match.group(1)}"
+    if match:
+        return "deep_dive", f"SKY-{match.group(1)}"
+
+    return "analysis", None
 
 
 @app.route("/health", methods=["GET"])
@@ -114,35 +139,37 @@ def health():
 
 @app.route("/slack/command", methods=["POST"])
 def slack_command():
-    """Handles /pmwatch slash command."""
     if not verify_slack_signature(request):
         return jsonify({"error": "Invalid signature"}), 403
 
     response_url = request.form.get("response_url")
     channel_id = request.form.get("channel_id")
-    user_name = request.form.get("user_name", "someone")
+    user_name = request.form.get("user_name", "Tyler")
+    text = request.form.get("text", "")
 
-    # Kick off analysis in background
-    thread = threading.Thread(
-        target=run_and_respond,
-        args=(response_url, channel_id),
-        daemon=True,
-    )
-    thread.start()
+    mode, project_query = parse_command(text)
 
-    # Respond within 3s
-    return jsonify({
-        "response_type": "in_channel",
-        "text": f":mag: On it, {user_name}. Checking Basecamp now... results in ~30 seconds.",
-    })
+    if mode == "deep_dive":
+        ack = f":mag: Looking up *{project_query}*... full status report in ~30 seconds."
+        target = handle_deep_dive
+        args = (response_url, channel_id, project_query)
+    elif mode == "briefing":
+        ack = ":sunrise: Generating morning briefing... coming up in ~45 seconds."
+        target = handle_briefing
+        args = (response_url, channel_id)
+    else:
+        ack = f":mag: On it, {user_name}. Scanning Basecamp... results in ~30 seconds."
+        target = handle_analysis
+        args = (response_url, channel_id)
+
+    threading.Thread(target=target, args=args, daemon=True).start()
+    return jsonify({"response_type": "in_channel", "text": ack})
 
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    """Handles Slack Events API (DMs to the bot)."""
     data = request.json or {}
 
-    # URL verification challenge
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
 
@@ -150,27 +177,28 @@ def slack_events():
         return jsonify({"error": "Invalid signature"}), 403
 
     event = data.get("event", {})
-    event_type = event.get("type")
-
-    # Respond to DMs or app mentions
-    if event_type in ("message", "app_mention") and not event.get("bot_id"):
-        text = event.get("text", "").lower().strip()
+    if event.get("type") in ("message", "app_mention") and not event.get("bot_id"):
+        text = event.get("text", "")
         channel_id = event.get("channel")
+        mode, project_query = parse_command(text)
 
-        trigger_words = ["check", "status", "update", "run", "watch", "pmwatch"]
-        if any(w in text for w in trigger_words) or event_type == "app_mention":
-            thread = threading.Thread(
-                target=run_and_respond,
-                args=(None, channel_id),
-                daemon=True,
-            )
-            thread.start()
+        slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
 
-            slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
-            slack_client.chat_postMessage(
-                channel=channel_id,
-                text=":mag: Checking Basecamp now... results in ~30 seconds.",
-            )
+        if mode == "deep_dive":
+            slack_client.chat_postMessage(channel=channel_id,
+                text=f":mag: Looking up *{project_query}*... full status in ~30 seconds.")
+            threading.Thread(target=handle_deep_dive,
+                args=(None, channel_id, project_query), daemon=True).start()
+        elif mode == "briefing":
+            slack_client.chat_postMessage(channel=channel_id,
+                text=":sunrise: Generating briefing... ~45 seconds.")
+            threading.Thread(target=handle_briefing,
+                args=(None, channel_id), daemon=True).start()
+        elif any(w in text.lower() for w in ["check", "status", "update", "run", "watch"]):
+            slack_client.chat_postMessage(channel=channel_id,
+                text=":mag: Scanning Basecamp... ~30 seconds.")
+            threading.Thread(target=handle_analysis,
+                args=(None, channel_id), daemon=True).start()
 
     return jsonify({"ok": True})
 

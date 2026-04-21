@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
 Skylark PM Watch Agent
-Monitors Basecamp via REST API and posts alerts to Slack #pm-watch
-Designed to run as a Google Cloud Run Job.
+Features: hourly alerts, morning briefing, deep dive, deduplication, stale detection
 """
 
+import hashlib
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anthropic
@@ -26,6 +27,9 @@ SCRIPT_DIR = Path(__file__).parent
 STATE_FILE = SCRIPT_DIR / "state.json"
 ENV_FILE = SCRIPT_DIR / ".env"
 
+SCHED_TAGS = ["[PM-SCHED]", "[ENG-SCHED]", "[PROC-SCHED]", "[SHOP-SCHED]",
+              "[LOG-SCHED]", "[ONS-SCHED]", "[COM-SCHED]", "[FUT-SCHED]"]
+
 
 # ── Env / secrets ──────────────────────────────────────────────────────────────
 
@@ -39,30 +43,24 @@ def load_env():
 
 
 def load_secrets_from_gcp():
-    """Pull secrets from Google Secret Manager when running on Cloud Run."""
     try:
         from google.cloud import secretmanager
     except ImportError:
         return
-
     project = os.environ.get("GOOGLE_CLOUD_PROJECT", "skylark-pm-agents")
     client = secretmanager.SecretManagerServiceClient()
-
-    secret_names = [
-        "BC_ACCESS_TOKEN", "BC_REFRESH_TOKEN", "BC_CLIENT_ID",
-        "BC_CLIENT_SECRET", "BC_TOKEN_EXPIRES_AT",
-        "SLACK_TOKEN", "SLACK_CHANNEL_ID", "ANTHROPIC_API_KEY",
-    ]
-
-    for name in secret_names:
+    for name in ["BC_ACCESS_TOKEN", "BC_REFRESH_TOKEN", "BC_CLIENT_ID",
+                 "BC_CLIENT_SECRET", "BC_TOKEN_EXPIRES_AT",
+                 "SLACK_TOKEN", "SLACK_CHANNEL_ID", "ANTHROPIC_API_KEY",
+                 "SLACK_SIGNING_SECRET"]:
         if os.environ.get(name):
             continue
         try:
             path = f"projects/{project}/secrets/{name}/versions/latest"
             resp = client.access_secret_version(request={"name": path})
             os.environ[name] = resp.payload.data.decode("utf-8")
-        except Exception as e:
-            print(f"Warning: could not load secret {name}: {e}")
+        except Exception:
+            pass
 
 
 # ── State ──────────────────────────────────────────────────────────────────────
@@ -70,14 +68,14 @@ def load_secrets_from_gcp():
 def load_state():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
-    return {"last_run": None}
+    return {"last_run": None, "seen_alerts": {}}
 
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-# ── Basecamp token refresh ─────────────────────────────────────────────────────
+# ── Token refresh ──────────────────────────────────────────────────────────────
 
 def token_needs_refresh():
     expires_at_str = os.environ.get("BC_TOKEN_EXPIRES_AT", "")
@@ -85,318 +83,441 @@ def token_needs_refresh():
         return True
     try:
         expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        # Refresh if less than 2 days remaining
-        return (expires_at - now).total_seconds() < 172800
+        return (expires_at - datetime.now(timezone.utc)).total_seconds() < 172800
     except Exception:
         return True
 
 
 def refresh_bc_token():
-    print("Refreshing Basecamp access token...")
+    print("Refreshing Basecamp token...")
     data = urllib.parse.urlencode({
         "type": "refresh",
         "client_id": os.environ["BC_CLIENT_ID"],
         "client_secret": os.environ["BC_CLIENT_SECRET"],
         "refresh_token": os.environ["BC_REFRESH_TOKEN"],
     }).encode()
-
-    req = urllib.request.Request(
-        TOKEN_ENDPOINT, data=data, method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
+    req = urllib.request.Request(TOKEN_ENDPOINT, data=data, method="POST",
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req) as resp:
         tokens = json.loads(resp.read())
-
     os.environ["BC_ACCESS_TOKEN"] = tokens["access_token"]
-    expires_in = tokens.get("expires_in", 1209600)
-    now = datetime.now(timezone.utc)
-    expires_at = now.replace(second=0, microsecond=0)
-    expires_at = expires_at.timestamp() + expires_in
-    expires_at_str = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
-    os.environ["BC_TOKEN_EXPIRES_AT"] = expires_at_str
-
-    # Update secret in GCP if running in cloud
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=tokens.get("expires_in", 1209600))).isoformat()
+    os.environ["BC_TOKEN_EXPIRES_AT"] = expires_at
     try:
         from google.cloud import secretmanager
         project = os.environ.get("GOOGLE_CLOUD_PROJECT", "skylark-pm-agents")
         client = secretmanager.SecretManagerServiceClient()
-        for secret_name, value in [
-            ("BC_ACCESS_TOKEN", tokens["access_token"]),
-            ("BC_TOKEN_EXPIRES_AT", expires_at_str),
-        ]:
-            parent = f"projects/{project}/secrets/{secret_name}"
+        for name, value in [("BC_ACCESS_TOKEN", tokens["access_token"]), ("BC_TOKEN_EXPIRES_AT", expires_at)]:
             client.add_secret_version(
-                request={"parent": parent, "payload": {"data": value.encode()}}
-            )
-        print("Updated tokens in Secret Manager")
-    except Exception as e:
-        print(f"Note: could not update Secret Manager: {e}")
+                request={"parent": f"projects/{project}/secrets/{name}",
+                         "payload": {"data": value.encode()}})
+    except Exception:
+        pass
 
 
 # ── Basecamp API ───────────────────────────────────────────────────────────────
 
-def bc_get(path, params=None):
-    url = f"{BC_BASE}{path}"
+def bc_get(path, params=None, retries=2):
+    url = path if path.startswith("http") else f"{BC_BASE}{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {os.environ['BC_ACCESS_TOKEN']}",
-        "User-Agent": USER_AGENT,
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        print(f"BC API error {e.code} on {path}")
-        return None
-    except Exception as e:
-        print(f"BC API error on {path}: {e}")
-        return None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {os.environ['BC_ACCESS_TOKEN']}",
+            "User-Agent": USER_AGENT,
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            return None
+        except Exception:
+            return None
+    return None
 
 
-def fetch_basecamp_data(last_run):
-    print("Fetching Basecamp data...")
+def get_dock_tool(project, tool_name):
+    dock = project.get("dock", [])
+    return next((d for d in dock if d["name"] == tool_name and d.get("enabled")), None)
 
-    # Recent account-wide events
+
+# ── Data fetching ──────────────────────────────────────────────────────────────
+
+def fetch_active_sky_projects(projects):
+    return [
+        p for p in (projects or [])
+        if p.get("name", "").startswith("SKY-") and p.get("status") == "active"
+    ]
+
+
+def fetch_todos_for_project(proj):
+    proj_id = proj["id"]
+    proj_name = proj["name"]
+    todoset_tool = get_dock_tool(proj, "todoset")
+    if not todoset_tool:
+        return [], []
+
+    todoset_id = todoset_tool["id"]
+    todolists = bc_get(f"/buckets/{proj_id}/todosets/{todoset_id}/todolists.json")
+    if not todolists:
+        return [], []
+
+    schedule_todos, labor_todos = [], []
+    for tlist in todolists[:12]:
+        list_id = tlist["id"]
+        todos = bc_get(f"/buckets/{proj_id}/todolists/{list_id}/todos.json",
+                       {"completed": "false"})
+        for todo in (todos or [])[:25]:
+            title = todo.get("content", "")
+            due = todo.get("due_on")
+            assignees = [a.get("name") for a in todo.get("assignees", [])]
+            entry = {
+                "project": proj_name,
+                "project_id": proj_id,
+                "title": title,
+                "due_on": due,
+                "assignees": assignees,
+                "app_url": todo.get("app_url"),
+                "description": (todo.get("description") or "")[:300],
+            }
+            if any(tag in title for tag in SCHED_TAGS):
+                schedule_todos.append(entry)
+            if "[LABOR]" in title:
+                labor_todos.append(entry)
+
+    return schedule_todos, labor_todos
+
+
+def fetch_messages_for_project(proj, since=None):
+    proj_id = proj["id"]
+    proj_name = proj["name"]
+    board_tool = get_dock_tool(proj, "message_board")
+    if not board_tool:
+        return []
+
+    board_id = board_tool["id"]
+    messages = bc_get(f"/buckets/{proj_id}/message_boards/{board_id}/messages.json")
+    result = []
+    for msg in (messages or [])[:8]:
+        created = msg.get("created_at", "")
+        if since and created < since:
+            continue
+        content = (msg.get("content") or "")
+        # Strip HTML tags roughly
+        import re
+        content = re.sub(r'<[^>]+>', ' ', content).strip()[:600]
+        entry = {
+            "project": proj_name,
+            "type": "message",
+            "board": board_tool.get("title", ""),
+            "title": msg.get("subject"),
+            "content": content,
+            "author": (msg.get("creator") or {}).get("name"),
+            "created_at": created,
+            "app_url": msg.get("app_url"),
+        }
+        result.append(entry)
+
+        # Fetch comments on this message
+        msg_id = msg.get("id")
+        comments = bc_get(f"/buckets/{proj_id}/recordings/{msg_id}/comments.json")
+        for comment in (comments or [])[:6]:
+            c_created = comment.get("created_at", "")
+            if since and c_created < since:
+                continue
+            c_content = re.sub(r'<[^>]+>', ' ', (comment.get("content") or "")).strip()[:300]
+            result.append({
+                "project": proj_name,
+                "type": "comment",
+                "parent_title": msg.get("subject"),
+                "content": c_content,
+                "author": (comment.get("creator") or {}).get("name"),
+                "created_at": c_created,
+                "app_url": msg.get("app_url"),
+            })
+    return result
+
+
+def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
+    print(f"Fetching Basecamp data (mode={mode})...")
+
     events_params = {"page": 1}
-    if last_run:
+    if last_run and mode == "analysis":
         events_params["since"] = last_run
-    events = bc_get("/events.json", events_params)
+    recent_events = bc_get("/events.json", events_params) or []
 
-    notifications = bc_get("/notifications.json")
-    projects = bc_get("/projects.json")
+    notifications = bc_get("/notifications.json") if mode == "analysis" else []
+    projects = bc_get("/projects.json") or []
+    sky_projects = fetch_active_sky_projects(projects)
 
-    active_projects = []
-    schedule_entries = []
-    labor_todos = []
-    schedule_tagged_todos = []
+    # Deep dive: filter to one project
+    if mode == "deep_dive" and project_query:
+        query_upper = project_query.upper()
+        sky_projects = [p for p in sky_projects if query_upper in p["name"].upper()][:1]
+        if not sky_projects:
+            return {"error": f"No active project found matching {project_query}"}
 
-    if projects:
-        # Focus on SKY- jobs that are not obviously LOI/closed
-        sky_projects = [
-            p for p in projects
-            if p.get("name", "").startswith("SKY-") and p.get("status") == "active"
-        ]
+    # Stale detection: projects with no events in the feed
+    active_project_ids_in_events = set()
+    for event in recent_events:
+        bucket = event.get("bucket") or {}
+        if bucket.get("id"):
+            active_project_ids_in_events.add(bucket["id"])
 
-        for proj in sky_projects[:25]:
-            proj_id = proj["id"]
-            proj_name = proj["name"]
-            desc = proj.get("description", "")
-
-            active_projects.append({
-                "id": proj_id,
-                "name": proj_name,
-                "description": desc,
+    stale_projects = []
+    for proj in sky_projects:
+        if "(LOI)" in proj["name"] or "(Design)" in proj["name"]:
+            continue
+        if proj["id"] not in active_project_ids_in_events:
+            stale_projects.append({
+                "project": proj["name"],
+                "description": proj.get("description", "")[:200],
             })
 
-            # Pull todosets to find schedule-tagged and labor todos
-            todosets = bc_get(f"/projects/{proj_id}/todosets.json")
-            if todosets:
-                for tset in todosets[:3]:
-                    tset_id = tset.get("id")
-                    todolists = bc_get(f"/projects/{proj_id}/todolists.json")
-                    if not todolists:
-                        continue
-                    for tlist in todolists[:10]:
-                        tlist_id = tlist.get("id")
-                        tlist_name = tlist.get("name", "")
-                        todos = bc_get(f"/projects/{proj_id}/todos.json", {"todolist_id": tlist_id, "completed": "false"})
-                        if not todos:
-                            continue
-                        for todo in todos[:20]:
-                            title = todo.get("content", "")
-                            due = todo.get("due_on")
-                            # Collect schedule-tagged todos (phase logic)
-                            if any(tag in title for tag in [
-                                "[PM-SCHED]", "[ENG-SCHED]", "[PROC-SCHED]",
-                                "[SHOP-SCHED]", "[LOG-SCHED]", "[ONS-SCHED]",
-                                "[COM-SCHED]", "[FUT-SCHED]"
-                            ]):
-                                schedule_tagged_todos.append({
-                                    "project": proj_name,
-                                    "project_id": proj_id,
-                                    "title": title,
-                                    "due_on": due,
-                                    "assignees": [a.get("name") for a in todo.get("assignees", [])],
-                                    "app_url": todo.get("app_url"),
-                                })
-                            # Collect labor todos
-                            if "[LABOR]" in title:
-                                labor_todos.append({
-                                    "project": proj_name,
-                                    "title": title,
-                                    "due_on": due,
-                                    "description": todo.get("description", ""),
-                                    "app_url": todo.get("app_url"),
-                                })
+    # Per-project data
+    all_schedule_todos, all_labor_todos, all_messages = [], [], []
+    project_summaries = []
+    limit = 1 if mode == "deep_dive" else 20
 
-            # Schedule entries
-            dock = proj.get("dock", [])
-            sched_tool = next((d for d in dock if d["name"] == "schedule"), None)
-            if sched_tool and sched_tool.get("enabled"):
-                entries = bc_get(f"/projects/{proj_id}/schedule_entries.json")
-                if entries:
-                    for e in entries[:5]:
-                        e["_project_name"] = proj_name
-                    schedule_entries.extend(entries[:5])
+    for proj in sky_projects[:limit]:
+        desc = proj.get("description", "")
+        project_summaries.append({
+            "id": proj["id"],
+            "name": proj["name"],
+            "description": desc[:300],
+        })
+
+        since_filter = last_run if mode == "analysis" else None
+        sched_todos, labor_todos = fetch_todos_for_project(proj)
+        messages = fetch_messages_for_project(proj, since=since_filter)
+
+        all_schedule_todos.extend(sched_todos)
+        all_labor_todos.extend(labor_todos)
+        all_messages.extend(messages)
+
+    # Upcoming schedule entries (briefing/deep dive)
+    schedule_entries = []
+    if mode in ("briefing", "deep_dive"):
+        for proj in sky_projects[:limit]:
+            sched_tool = get_dock_tool(proj, "schedule")
+            if sched_tool:
+                entries = bc_get(f"/buckets/{proj['id']}/schedules/{sched_tool['id']}/entries.json")
+                for e in (entries or [])[:5]:
+                    e["_project_name"] = proj["name"]
+                schedule_entries.extend((entries or [])[:5])
 
     return {
-        "recent_events": events,
-        "notifications": notifications,
-        "active_projects": active_projects[:30],
-        "schedule_tagged_todos": schedule_tagged_todos[:60],
-        "labor_todos": labor_todos[:30],
+        "mode": mode,
+        "recent_events": recent_events[:60] if mode == "analysis" else [],
+        "notifications": (notifications or [])[:30],
+        "project_summaries": project_summaries,
+        "schedule_tagged_todos": all_schedule_todos[:80],
+        "labor_todos": all_labor_todos[:40],
+        "messages_and_comments": all_messages[:80],
+        "stale_projects": stale_projects[:20],
         "upcoming_schedule_entries": schedule_entries[:30],
         "last_run": last_run,
+        "as_of": datetime.now(timezone.utc).isoformat(),
     }
 
 
-# ── Claude analysis ────────────────────────────────────────────────────────────
+# ── Alert deduplication ────────────────────────────────────────────────────────
+
+def alert_fingerprint(alert):
+    key = f"{alert.get('project','')}-{alert.get('category','')}-{alert.get('description','')[:60]}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+
+def deduplicate_alerts(alerts, state):
+    seen = state.get("seen_alerts", {})
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    seen = {k: v for k, v in seen.items() if v > cutoff}
+
+    new_alerts = []
+    for alert in alerts:
+        fp = alert_fingerprint(alert)
+        if fp not in seen:
+            new_alerts.append(alert)
+            seen[fp] = datetime.now(timezone.utc).isoformat()
+
+    state["seen_alerts"] = seen
+    return new_alerts, state
+
+
+# ── SOP context ────────────────────────────────────────────────────────────────
 
 SKYLARK_SOP_CONTEXT = """
 ## Skylark AV Operations Standards
 
-### Basecamp Project Structure (Required)
-Every SKY- project must have these fields in the Project Description:
-- Client Contact: [Name / Title / Email / Phone]
-- Job Location: [Address]
-- Skylark PM: [Name]
-- Engineer: [Name]
-- On-Site Lead: [Name]
-TBD is acceptable ONLY for LOI-phase (Letter of Intent) projects. Active jobs must have real names.
+### Project Description (Required Fields)
+Every active SKY- project must have in its description: Client Contact, Job Location, Skylark PM, Engineer, On-Site Lead.
+TBD is only acceptable for LOI-phase or Design-only projects.
 
 ### Schedule Tag System
-Todos in Basecamp use tags to indicate phase. Only todos with these tags and a due_on date activate a phase:
-[PM-SCHED] = Project Management milestones
-[ENG-SCHED] = Engineering milestones
-[PROC-SCHED] = Procurement milestones
-[SHOP-SCHED] = Shop/Rack Build milestones
-[LOG-SCHED] = Logistics milestones
-[ONS-SCHED] = Onsite/Install milestones
-[COM-SCHED] = Commissioning milestones
-[FUT-SCHED] = Sales/Forecast
+[PM-SCHED] [ENG-SCHED] [PROC-SCHED] [SHOP-SCHED] [LOG-SCHED] [ONS-SCHED] [COM-SCHED] [FUT-SCHED]
+CRITICAL: Any incomplete schedule-tagged todo WITHOUT a due_on date = missing_dates flag.
 
-CRITICAL: Any incomplete schedule-tagged todo WITHOUT a due date is a "missing_dates" flag — it means the project schedule is broken and needs PM attention.
-
-### Key Milestone Timing (relative to onsite date)
-- 25% Design Basis locked [ENG-SCHED]: 16-18 weeks before onsite
+### Key Milestone Timing (relative to onsite)
+- 25% Design Basis [ENG-SCHED]: 16-18 weeks before onsite
 - 50% Design Review / Order Ready [ENG-SCHED]: 13 weeks before onsite
-- Handoff to Procurement (Long Lead) [ENG-SCHED]: 12 weeks before onsite
+- Handoff to Procurement Long Lead [ENG-SCHED]: 12 weeks before onsite
 - 75% Design Docs [ENG-SCHED]: 7 weeks before onsite
-- Handoff to Procurement (Short Lead) [ENG-SCHED]: 6 weeks before onsite
+- Handoff to Procurement Short Lead [ENG-SCHED]: 6 weeks before onsite
 - Cable order [PROC-SCHED]: 4 weeks before onsite
 - Rack Build complete [SHOP-SCHED]: 2 weeks before onsite
-- Verify Equipment/Materials [LOG-SCHED]: 2 weeks before onsite
+- Verify Equipment [LOG-SCHED]: 2 weeks before onsite
 - Punch List Walkthrough [PM-SCHED]: 48 hours before end of install
 - Client Sign-Off [PM-SCHED]: before pulling off job
-- As-Built Package Delivered [ENG-SCHED]: 2 weeks after open
-- Internal Post-Mortem [PM-SCHED]: 1 week after open
-- Project Closed in Basecamp [PM-SCHED]: 90 days after open
+- As-Built Package [ENG-SCHED]: 2 weeks after open
+- Post-Mortem [PM-SCHED]: 1 week after open
+- Project Closed [PM-SCHED]: 90 days after open
 
-### Labor Scheduling SOP
-Each field tech assignment gets a [LABOR] todo with title format: `Name | Role | Status [LABOR]`
-The todo description must have flights, hotel, per-diem, and car info filled in.
-Missing travel details on a [LABOR] todo for an upcoming trip is a flag.
+### Labor Scheduling
+[LABOR] todos: format = "Name | Role | Status [LABOR]"
+Description must have Flights, Hotel, Per-Diem, Car Rental filled in.
+Missing travel info on an upcoming trip = flag.
 
 ### Pre-Mobilization Gate
-A GO/NO-GO check must happen 14 days AND 7 days before mobilization.
-If a project has an [ONS-SCHED] todo coming up in <14 days with no evidence of GO/NO-GO, flag it.
+GO/NO-GO check required 14 days AND 7 days before mobilization.
+No evidence of GO/NO-GO with [ONS-SCHED] due in <14 days = flag.
 
 ### Communication Rules
-- Client communication → "Client Communication" message board only
-- Internal updates → "Internal Coordination" message board only
-- All scheduling → To-Dos (not messages)
+- Client posts → "Client Communication" board only
+- Internal updates → "Internal Coordination" board only
 - Decisions/actions from calls must be logged in Basecamp
 
-### Phase Logic (Mission Control)
-A project is in closeout when "Client First Open [PM-SCHED]" has passed but "Project Closed in Basecamp [PM-SCHED]" is not complete.
-Projects in closeout > 90 days without closure are overdue.
+### Closeout
+Project is overdue for closure if "Client First Open [PM-SCHED]" passed >90 days ago
+and "Project Closed in Basecamp [PM-SCHED]" is still incomplete.
 """
 
-def analyze_with_claude(anthropic_client, data_bundle, last_run):
-    since_str = last_run if last_run else "the past hour"
 
-    prompt = f"""You are a PM watch agent for Skylark AV, an AV installation company that designs and installs audio, video, and lighting systems for large churches and venues.
+# ── Claude analysis ────────────────────────────────────────────────────────────
 
-Tyler is the founder/owner. Your job is to review Basecamp data and flag items that need his attention based on Skylark's exact operations standards below.
+def analyze_with_claude(anthropic_client, data_bundle):
+    mode = data_bundle.get("mode", "analysis")
+    last_run = data_bundle.get("last_run")
+    since_str = last_run or "the past hour"
+
+    if mode == "briefing":
+        prompt = f"""You are the PM Watch agent for Skylark AV. Generate a morning briefing for Tyler (founder/owner).
 
 {SKYLARK_SOP_CONTEXT}
 
----
+Today is {data_bundle['as_of'][:10]}.
 
-Review the data below (activity since {since_str}) and flag these specific issues:
+Review all active project data below and produce a clear morning briefing in Slack markdown.
 
-1. **Upset / Frustrated** — tense or frustrated tone in messages, comments, or notifications from clients, PMs, or field staff. Look especially at Client Communication boards.
+Format:
+- Start with a one-line summary count (e.g. "12 active jobs — 3 need attention")
+- List jobs needing action first (with specific issue)
+- Then jobs that are all-clear (just name + current phase)
+- End with a "This Week" section: key milestones due in the next 7 days across all jobs
 
-2. **Missing Dates (Critical)** — any incomplete schedule-tagged todo ([XXXX-SCHED]) with no due_on date. This breaks Mission Control phase logic. Flag each project affected.
+Use :red_circle: for high issues, :large_yellow_circle: for medium, :white_check_mark: for clear.
+Be specific — name the todo, the person, the date.
 
-3. **SOP Deviation** — examples:
-   - Active (non-LOI) project with Engineer = TBD or On-Site Lead = TBD in description
-   - [LABOR] todo for an upcoming trip missing flight/hotel/car details
-   - Project missing required description fields (Client Contact, Job Location, PM, Engineer, On-Site Lead)
-   - Schedule items or decisions that appear to be in wrong message board
+--- DATA ---
+{json.dumps(data_bundle, indent=2)[:22000]}
+"""
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=3000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return {"type": "briefing", "text": response.content[0].text.strip()}
 
-4. **Schedule Risk** — examples:
-   - [ONS-SCHED] install trip coming up within 14 days with no GO/NO-GO evidence
-   - Rack Build [SHOP-SCHED] due date is <2 weeks before onsite but not yet complete
-   - Procurement milestones missed relative to onsite date
-   - Onsite or commissioning schedule entry with no participants assigned
+    elif mode == "deep_dive":
+        project_name = (data_bundle.get("project_summaries") or [{}])[0].get("name", "Unknown")
+        prompt = f"""You are the PM Watch agent for Skylark AV. Give Tyler a full status report on {project_name}.
 
-5. **Communication Gap** — questions in messages or comments with no response for 24+ hours, especially on Client Communication boards.
+{SKYLARK_SOP_CONTEXT}
 
-6. **Closeout Overdue** — project where "Client First Open" has passed but "Project Closed in Basecamp" is still open and it has been > 90 days.
+As of {data_bundle['as_of'][:10]}.
 
-Be specific and actionable. Reference the exact todo title, project name, and timing when relevant.
-Do NOT flag LOI-phase projects for TBD fields. Do NOT flag normal routine activity.
+Cover:
+1. Project description fields (PM, Engineer, On-Site Lead, Client Contact)
+2. Current active phase (based on incomplete schedule-tagged todos with due dates)
+3. Upcoming milestones (next 30 days)
+4. Labor/travel status (any [LABOR] todos and their travel details)
+5. Recent messages/comments — tone, open questions, anything unresolved
+6. Any SOP violations or flags
+7. Overall health: GREEN / YELLOW / RED with one-line reason
 
-Return ONLY a JSON array. Each object:
-{{
-  "category": "Upset Team Member | Missing Dates | SOP Deviation | Schedule Risk | Communication Gap | Closeout Overdue",
+Use Slack markdown. Be specific and concise.
+
+--- DATA ---
+{json.dumps(data_bundle, indent=2)[:22000]}
+"""
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=2500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return {"type": "deep_dive", "project": project_name, "text": response.content[0].text.strip()}
+
+    else:
+        # Standard hourly/on-demand alert analysis
+        prompt = f"""You are the PM Watch agent for Skylark AV. Review Basecamp activity since {since_str} and flag issues needing Tyler's attention.
+
+{SKYLARK_SOP_CONTEXT}
+
+Flag these issues:
+1. **Upset / Frustrated** — tense tone in messages or comments (read the actual content)
+2. **Missing Dates** — incomplete [XXXX-SCHED] todo with no due_on date (breaks phase logic)
+3. **SOP Deviation** — wrong board, TBD fields on active jobs, [LABOR] missing travel info, no GO/NO-GO before install
+4. **Schedule Risk** — milestones overdue relative to onsite dates, install <14 days with no GO/NO-GO
+5. **Communication Gap** — client or team question unanswered for 24+ hours
+6. **Stale Project** — active-phase project with zero recent Basecamp activity
+7. **Closeout Overdue** — Client First Open passed >90 days ago, project not closed
+
+Only flag real issues. Skip LOI/Design-only projects for TBD fields.
+
+Return ONLY a JSON array:
+[{{
+  "category": "Upset Team Member | Missing Dates | SOP Deviation | Schedule Risk | Communication Gap | Stale Project | Closeout Overdue",
   "severity": "high | medium | low",
-  "description": "1-2 sentences. Be specific: name the project, todo, or person involved.",
-  "url": "basecamp app_url if available, else null",
-  "project": "SKY-XXXX project name"
-}}
+  "description": "1-2 sentences. Name the project, todo, person, and timing.",
+  "url": "basecamp app_url or null",
+  "project": "SKY-XXXX project name or null"
+}}]
 
 If nothing needs attention, return [].
 
 --- DATA ---
 {json.dumps(data_bundle, indent=2)[:22000]}
 """
-
-    response = anthropic_client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    text = response.content[0].text.strip()
-    if "```json" in text:
-        text = text.split("```json")[1].split("```")[0].strip()
-    elif "```" in text:
-        text = text.split("```")[1].split("```")[0].strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        print(f"Could not parse Claude response:\n{text}")
-        return []
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=2500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+        try:
+            return {"type": "alerts", "alerts": json.loads(text)}
+        except json.JSONDecodeError:
+            print(f"Could not parse Claude response:\n{text}")
+            return {"type": "alerts", "alerts": []}
 
 
-# ── Slack ──────────────────────────────────────────────────────────────────────
+# ── Slack posting ──────────────────────────────────────────────────────────────
 
-def post_to_slack(slack_client, channel_id, alerts):
+SEVERITY_EMOJI = {"high": ":red_circle:", "medium": ":large_yellow_circle:", "low": ":large_blue_circle:"}
+
+
+def post_alerts_to_slack(slack_client, channel_id, alerts, title=None):
     now = datetime.now().strftime("%b %d, %I:%M %p")
-    severity_emoji = {"high": ":red_circle:", "medium": ":large_yellow_circle:", "low": ":large_blue_circle:"}
-
+    header = title or f"PM Watch  —  {now}"
     blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": f"PM Watch  —  {now}"}},
+        {"type": "header", "text": {"type": "plain_text", "text": header}},
         {"type": "divider"},
     ]
-
     for alert in alerts:
-        emoji = severity_emoji.get(alert.get("severity", "low"), ":large_blue_circle:")
+        emoji = SEVERITY_EMOJI.get(alert.get("severity", "low"), ":large_blue_circle:")
         project_line = f"\n_Project: {alert['project']}_" if alert.get("project") else ""
         text = f"{emoji}  *{alert['category']}*{project_line}\n{alert['description']}"
         section = {"type": "section", "text": {"type": "mrkdwn", "text": text}}
@@ -408,67 +529,108 @@ def post_to_slack(slack_client, channel_id, alerts):
             }
         blocks.append(section)
         blocks.append({"type": "divider"})
-
     slack_client.chat_postMessage(
-        channel=channel_id,
-        blocks=blocks,
+        channel=channel_id, blocks=blocks,
         text=f"PM Watch: {len(alerts)} alert(s) need your attention",
     )
 
 
-# ── Core analysis (used by both scheduled job and webhook) ─────────────────────
+def post_freeform_to_slack(slack_client, channel_id, text, fallback="PM Watch update"):
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+    slack_client.chat_postMessage(channel=channel_id, blocks=blocks, text=fallback)
+
+
+# ── Public API (used by webhook and job) ──────────────────────────────────────
 
 def run_analysis(on_demand=False):
-    """Run a full Basecamp analysis. Returns (alerts, last_run)."""
+    """Hourly or on-demand alert scan. Returns list of new alerts."""
+    load_env()
+    load_secrets_from_gcp()
+    if token_needs_refresh():
+        refresh_bc_token()
+
+    state = load_state()
+    last_run = None if on_demand else state.get("last_run")
+
+    data = fetch_basecamp_data(last_run=last_run, mode="analysis")
+    result = analyze_with_claude(
+        anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]), data
+    )
+    alerts = result.get("alerts", [])
+
+    # Deduplicate
+    alerts, state = deduplicate_alerts(alerts, state)
+
+    if not on_demand:
+        state["last_run"] = datetime.now(timezone.utc).isoformat()
+    save_state(state)
+    return alerts
+
+
+def run_briefing():
+    """Morning briefing — full project health summary."""
+    load_env()
+    load_secrets_from_gcp()
+    if token_needs_refresh():
+        refresh_bc_token()
+
+    data = fetch_basecamp_data(mode="briefing")
+    result = analyze_with_claude(
+        anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]), data
+    )
+    return result.get("text", "No briefing generated.")
+
+
+def run_deep_dive(project_query):
+    """Full status report on a specific project."""
+    load_env()
+    load_secrets_from_gcp()
+    if token_needs_refresh():
+        refresh_bc_token()
+
+    data = fetch_basecamp_data(mode="deep_dive", project_query=project_query)
+    if "error" in data:
+        return data["error"]
+
+    result = analyze_with_claude(
+        anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]), data
+    )
+    return result.get("text", "No data found.")
+
+
+# ── Main (Cloud Run Job — scheduled hourly) ───────────────────────────────────
+
+def main():
     load_env()
     load_secrets_from_gcp()
 
     for var in ["BC_ACCESS_TOKEN", "BC_REFRESH_TOKEN", "BC_CLIENT_ID",
                 "BC_CLIENT_SECRET", "SLACK_TOKEN", "SLACK_CHANNEL_ID", "ANTHROPIC_API_KEY"]:
         if not os.environ.get(var):
-            raise RuntimeError(f"{var} not set")
+            print(f"ERROR: {var} not set")
+            sys.exit(1)
 
-    if token_needs_refresh():
-        refresh_bc_token()
+    mode = os.environ.get("RUN_MODE", "analysis")
+    slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
+    channel_id = os.environ["SLACK_CHANNEL_ID"]
 
-    state = load_state()
-    # On-demand runs look back 24 hours regardless of last scheduled run
-    last_run = None if on_demand else state.get("last_run")
-    print(f"Running PM Watch... (last run: {last_run or 'never'}, on_demand={on_demand})")
-
-    data_bundle = fetch_basecamp_data(last_run)
-
-    print("Analyzing with Claude...")
-    anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    alerts = analyze_with_claude(anthropic_client, data_bundle, last_run)
-    print(f"Found {len(alerts)} alert(s)")
-
-    if not on_demand:
-        state["last_run"] = datetime.now(timezone.utc).isoformat()
-        save_state(state)
-
-    return alerts
-
-
-# ── Main (scheduled Cloud Run Job) ─────────────────────────────────────────────
-
-def main():
-    try:
-        alerts = run_analysis(on_demand=False)
-    except RuntimeError as e:
-        print(f"ERROR: {e}")
-        sys.exit(1)
-
-    if alerts:
-        slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
-        try:
-            post_to_slack(slack_client, os.environ["SLACK_CHANNEL_ID"], alerts)
-            print(f"Posted {len(alerts)} alert(s) to Slack")
-        except SlackApiError as e:
-            print(f"Slack error: {e.response['error']}")
+    if mode == "briefing":
+        print("Running morning briefing...")
+        text = run_briefing()
+        post_freeform_to_slack(slack_client, channel_id, text, "Skylark PM Morning Briefing")
+        print("Briefing posted.")
     else:
-        print("All clear — nothing to post")
-
+        print("Running hourly analysis...")
+        alerts = run_analysis(on_demand=False)
+        print(f"Found {len(alerts)} new alert(s)")
+        if alerts:
+            try:
+                post_alerts_to_slack(slack_client, channel_id, alerts)
+                print(f"Posted {len(alerts)} alert(s) to Slack")
+            except SlackApiError as e:
+                print(f"Slack error: {e.response['error']}")
+        else:
+            print("All clear — nothing to post")
     print("Done.")
 
 
