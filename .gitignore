@@ -1,0 +1,7 @@
+.env
+basecamp_tokens.json
+state.json
+*.log
+__pycache__/
+*.pyc
+.DS_Store
