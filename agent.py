@@ -401,7 +401,13 @@ SKYLARK_SOP_CONTEXT = """
 ## Skylark AV Operations Standards
 
 ### Project Description (Required Fields)
-Every active SKY- project must have in its description: Client Contact, Job Location, Skylark PM, Engineer, On-Site Lead.
+Every active SKY- project must have exactly these 5 fields in its description:
+- Client Contact
+- Job Location
+- Skylark PM
+- Engineer
+- On-Site Lead
+No dates are expected in the description. Dates live in schedule-tagged todos only.
 TBD is only acceptable for LOI-phase or Design-only projects.
 
 ### Schedule Tag System
