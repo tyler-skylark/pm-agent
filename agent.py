@@ -414,15 +414,52 @@ TBD is only acceptable for LOI-phase or Design-only projects.
 [PM-SCHED] [ENG-SCHED] [PROC-SCHED] [SHOP-SCHED] [LOG-SCHED] [ONS-SCHED] [COM-SCHED] [FUT-SCHED]
 CRITICAL: Any incomplete schedule-tagged todo WITHOUT a due_on date = missing_dates flag.
 
-### Key Milestone Timing (relative to onsite)
-- 25% Design Basis [ENG-SCHED]: 16-18 weeks before onsite
-- 50% Design Review / Order Ready [ENG-SCHED]: 13 weeks before onsite
-- Handoff to Procurement Long Lead [ENG-SCHED]: 12 weeks before onsite
-- 75% Design Docs [ENG-SCHED]: 7 weeks before onsite
-- Handoff to Procurement Short Lead [ENG-SCHED]: 6 weeks before onsite
-- Cable order [PROC-SCHED]: 4 weeks before onsite
-- Rack Build complete [SHOP-SCHED]: 2 weeks before onsite
-- Verify Equipment [LOG-SCHED]: 2 weeks before onsite
+### Engineering Milestone System
+Engineering runs two coordinated tracks: Construction DD/CD and AV Systems.
+These tracks are related but distinct. Procurement releases in stages as engineering confidence increases.
+Once a package reaches IFC it is in revision-only mode — all changes tracked via Revision IDs + revision clouds.
+
+Key terms:
+- DD: design development issue phase for construction coordination
+- CD: post-DD coordination phase driven by trades, client changes, or field conditions
+- IFC: issued for construction — final released package for execution
+- Issue Set: a formally published milestone package
+- Revision: a tracked change to an issued package
+
+#### Construction DD/CD Track [ENG-SCHED]
+**Milestone 1** — Early GC coordination: weight loads, heat loads, AV spaces identified, total power requirements, "provided by others" callouts, rough coordination mockups. Deliverable: DD/CD Issue Set.
+**Milestone 2** — Further GC coordination: circuit Jbox locations, furniture mockups. Deliverable: DD/CD Issue Set.
+**Milestone 3** — Construction DD effectively complete. Must include: complete and coherent coordination package, ready for internal review then immediate client review.
+  Review sequence: (1) Internal design review → (2) Client review
+**Milestone 4** — 100% GC handoff to trades. Standard: baseline issue for construction coordination, design development complete; all future changes must come from coordination feedback, field conditions, or client-driven changes — NOT unfinished engineering work. Deliverable: 100% DD/CD Construction Issue Set.
+**CD Phase** — Responds to changes after DD baseline. CD changes are reactions to other trades, not open-ended design. The same 100% DD package may be re-issued to meet GC/architect milestones; those external milestones do not create new internal engineering phases. Revisions must be tracked clearly.
+
+#### AV Systems Track [ENG-SCHED]
+**25% AV Systems** — Goal: establish big-picture system layout and surface risk early.
+  Must include: file structure, equipment blocks layout, system roughly built by room, big-picture system view established, some lines/cables may begin, Order Detail items represented.
+  Internal use: Concept Drawing Comparison Review, PM checkpoint, early discovery of missing gear/scope gaps/system problems.
+  Procurement: Release 1 for major component long-lead items.
+**50% AV Systems** — Goal: package far enough for engineering coordination and shop planning.
+  Must include: wires drawn, rack elevations created, power plan, Custom Panels, overall system layout complete.
+  Deliverables: first pass Design Review, package may be given to shop for planning, Custom Panels client signoff.
+  Procurement: Release 2 for additional equipment.
+**75% AV Systems** — Goal: essentially complete systems design.
+  Must include: systems design complete, wire numbers complete, system logic complete, package ready for systems review.
+  Review: internal systems design review.
+  Procurement: Release 3 for remaining equipment.
+**100% AV Systems** — Goal: complete physical implementation package.
+  Must include: physical design complete, speaker locations complete, LED wall details complete, TV placement complete, rigging drawings complete, cable pull schedules complete.
+  Review: internal review with install team involvement, client review as needed.
+  Procurement: Release 4 for rigging and physical infrastructure not previously released.
+**IFC (Issued for Construction)** — Final released package for execution. Revision-only mode from this point forward.
+
+#### SOP Violations to Flag [ENG-SCHED]
+- Engineering doing new/open-ended design work after Milestone 4 / CD phase = violation (should be reactions only)
+- No review sequence at Milestone 3 (internal → client) = flag
+- Procurement released before corresponding AV Systems milestone = flag
+- IFC package being edited without tracked Revision IDs = flag
+- Missing Milestone deliverables (no Issue Set published at M1/M2/M4) = flag
+
 - Punch List Walkthrough [PM-SCHED]: 48 hours before end of install
 - Client Sign-Off [PM-SCHED]: before pulling off job
 - As-Built Package [ENG-SCHED]: 2 weeks after open
