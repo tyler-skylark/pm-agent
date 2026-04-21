@@ -128,15 +128,61 @@ def bc_get(path, params=None, retries=2):
         })
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read())
+                return json.loads(resp.read()), resp.headers.get("Link", "")
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 time.sleep(2 ** attempt)
                 continue
-            return None
+            return None, ""
         except Exception:
-            return None
-    return None
+            return None, ""
+    return None, ""
+
+
+def bc_get_data(path, params=None):
+    """Fetch a single page, return just the data."""
+    data, _ = bc_get(path, params)
+    return data
+
+
+def bc_get_all(path, params=None, max_pages=10):
+    """Fetch all pages of a paginated BC3 endpoint."""
+    import re
+    results = []
+    url = (path if path.startswith("http") else f"{BC_BASE}{path}")
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+
+    for _ in range(max_pages):
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {os.environ['BC_ACCESS_TOKEN']}",
+            "User-Agent": USER_AGENT,
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+                link_header = resp.headers.get("Link", "")
+        except Exception:
+            break
+
+        if isinstance(data, list):
+            results.extend(data)
+        else:
+            return data  # not a list, just return as-is
+
+        # Parse next page from Link header
+        next_url = None
+        for part in link_header.split(","):
+            if 'rel="next"' in part:
+                match = re.search(r'<([^>]+)>', part)
+                if match:
+                    next_url = match.group(1)
+                    break
+        if not next_url:
+            break
+        url = next_url
+
+    return results
 
 
 def get_dock_tool(project, tool_name):
@@ -161,14 +207,14 @@ def fetch_todos_for_project(proj):
         return [], []
 
     todoset_id = todoset_tool["id"]
-    todolists = bc_get(f"/buckets/{proj_id}/todosets/{todoset_id}/todolists.json")
+    todolists = bc_get_data(f"/buckets/{proj_id}/todosets/{todoset_id}/todolists.json")
     if not todolists:
         return [], []
 
     schedule_todos, labor_todos = [], []
     for tlist in todolists[:12]:
         list_id = tlist["id"]
-        todos = bc_get(f"/buckets/{proj_id}/todolists/{list_id}/todos.json",
+        todos = bc_get_data(f"/buckets/{proj_id}/todolists/{list_id}/todos.json",
                        {"completed": "false"})
         for todo in (todos or [])[:25]:
             title = todo.get("content", "")
@@ -199,7 +245,7 @@ def fetch_messages_for_project(proj, since=None):
         return []
 
     board_id = board_tool["id"]
-    messages = bc_get(f"/buckets/{proj_id}/message_boards/{board_id}/messages.json")
+    messages = bc_get_data(f"/buckets/{proj_id}/message_boards/{board_id}/messages.json")
     result = []
     for msg in (messages or [])[:8]:
         created = msg.get("created_at", "")
@@ -223,7 +269,7 @@ def fetch_messages_for_project(proj, since=None):
 
         # Fetch comments on this message
         msg_id = msg.get("id")
-        comments = bc_get(f"/buckets/{proj_id}/recordings/{msg_id}/comments.json")
+        comments = bc_get_data(f"/buckets/{proj_id}/recordings/{msg_id}/comments.json")
         for comment in (comments or [])[:6]:
             c_created = comment.get("created_at", "")
             if since and c_created < since:
@@ -247,18 +293,20 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
     events_params = {"page": 1}
     if last_run and mode == "analysis":
         events_params["since"] = last_run
-    recent_events = bc_get("/events.json", events_params) or []
+    recent_events = bc_get_data("/events.json", events_params) or []
 
-    notifications = bc_get("/notifications.json") if mode == "analysis" else []
-    projects = bc_get("/projects.json") or []
+    notifications = bc_get_data("/notifications.json") if mode == "analysis" else []
+    projects = bc_get_all("/projects.json") or []
     sky_projects = fetch_active_sky_projects(projects)
 
-    # Deep dive: filter to one project
+    # Deep dive: search all SKY- projects (regardless of status)
     if mode == "deep_dive" and project_query:
         query_upper = project_query.upper()
-        sky_projects = [p for p in sky_projects if query_upper in p["name"].upper()][:1]
-        if not sky_projects:
-            return {"error": f"No active project found matching {project_query}"}
+        all_sky = [p for p in projects if p.get("name", "").upper().startswith("SKY-")]
+        matched = [p for p in all_sky if query_upper in p["name"].upper()][:1]
+        if not matched:
+            return {"error": f"No project found matching {project_query}"}
+        sky_projects = matched
 
     # Stale detection: projects with no events in the feed
     active_project_ids_in_events = set()
@@ -304,7 +352,7 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
         for proj in sky_projects[:limit]:
             sched_tool = get_dock_tool(proj, "schedule")
             if sched_tool:
-                entries = bc_get(f"/buckets/{proj['id']}/schedules/{sched_tool['id']}/entries.json")
+                entries = bc_get_data(f"/buckets/{proj['id']}/schedules/{sched_tool['id']}/entries.json")
                 for e in (entries or [])[:5]:
                     e["_project_name"] = proj["name"]
                 schedule_entries.extend((entries or [])[:5])
