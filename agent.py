@@ -732,7 +732,7 @@ def run_deep_dive(project_query):
     return result.get("text", "No data found.")
 
 
-# ── Main (Cloud Run Job — scheduled hourly) ───────────────────────────────────
+# ── Main (Cloud Run Job) ───────────────────────────────────────────────────────
 
 def main():
     load_env()
@@ -745,26 +745,40 @@ def main():
             sys.exit(1)
 
     mode = os.environ.get("RUN_MODE", "analysis")
-    slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
+    on_demand = os.environ.get("ON_DEMAND", "false").lower() == "true"
     channel_id = os.environ["SLACK_CHANNEL_ID"]
+    slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
 
     if mode == "briefing":
-        print("Running morning briefing...")
+        print("Running briefing...")
         text = run_briefing()
-        post_freeform_to_slack(slack_client, channel_id, text, "Skylark PM Morning Briefing")
+        post_freeform_to_slack(slack_client, channel_id, text, "Skylark PM Briefing")
         print("Briefing posted.")
+
+    elif mode == "deep_dive":
+        project_query = os.environ.get("PROJECT_QUERY", "")
+        print(f"Running deep dive: {project_query}")
+        text = run_deep_dive(project_query)
+        post_freeform_to_slack(slack_client, channel_id, text, f"Deep Dive: {project_query}")
+        print("Deep dive posted.")
+
     else:
-        print("Running hourly analysis...")
-        alerts = run_analysis(on_demand=False)
+        print(f"Running analysis (on_demand={on_demand})...")
+        alerts = run_analysis(on_demand=on_demand)
         print(f"Found {len(alerts)} new alert(s)")
         if alerts:
             try:
-                post_alerts_to_slack(slack_client, channel_id, alerts)
+                title = "PM Watch (on-demand)" if on_demand else "PM Watch"
+                post_alerts_to_slack(slack_client, channel_id, alerts, title=title)
                 print(f"Posted {len(alerts)} alert(s) to Slack")
             except SlackApiError as e:
                 print(f"Slack error: {e.response['error']}")
         else:
+            if on_demand:
+                msg = ":white_check_mark: *All clear* — no issues found across active Skylark projects."
+                post_freeform_to_slack(slack_client, channel_id, msg)
             print("All clear — nothing to post")
+
     print("Done.")
 
 

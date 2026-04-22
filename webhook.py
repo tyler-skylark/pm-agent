@@ -2,6 +2,7 @@
 """
 PM Watch Slack webhook
 Handles /pmwatch slash command and DMs.
+Triggers the pm-agent Cloud Run Job for all long-running work.
 """
 
 import hashlib
@@ -9,20 +10,21 @@ import hmac
 import json
 import os
 import re
-import threading
 import time
 import urllib.request
 
+import google.auth
+import google.auth.transport.requests
 from flask import Flask, request, jsonify
 from slack_sdk import WebClient
 
-from agent import (
-    load_env, load_secrets_from_gcp,
-    run_analysis, run_briefing, run_deep_dive,
-    post_alerts_to_slack, post_freeform_to_slack,
-)
+from agent import load_env, load_secrets_from_gcp
 
 app = Flask(__name__)
+
+GCP_PROJECT = "skylark-pm-agents"
+GCP_REGION = "us-central1"
+JOB_NAME = "pm-agent"
 
 
 def verify_slack_signature(req):
@@ -37,75 +39,41 @@ def verify_slack_signature(req):
     return hmac.compare_digest(expected, req.headers.get("X-Slack-Signature", ""))
 
 
-def post_to_response_url(response_url, text, blocks=None):
-    payload = json.dumps({
-        "response_type": "in_channel",
-        "text": text,
-        **({"blocks": blocks} if blocks else {}),
-    }).encode()
-    req = urllib.request.Request(
-        response_url, data=payload, method="POST",
-        headers={"Content-Type": "application/json"},
-    )
+def trigger_job(mode, channel_id, project_query=None):
+    """Trigger the pm-agent Cloud Run Job with env overrides — runs independently."""
     try:
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        credentials.refresh(google.auth.transport.requests.Request())
+
+        env = [
+            {"name": "RUN_MODE", "value": mode},
+            {"name": "SLACK_CHANNEL_ID", "value": channel_id},
+            {"name": "ON_DEMAND", "value": "true"},
+        ]
+        if project_query:
+            env.append({"name": "PROJECT_QUERY", "value": project_query})
+
+        url = (f"https://run.googleapis.com/v2/projects/{GCP_PROJECT}"
+               f"/locations/{GCP_REGION}/jobs/{JOB_NAME}:run")
+        payload = json.dumps({
+            "overrides": {"containerOverrides": [{"env": env}]}
+        }).encode()
+        req = urllib.request.Request(url, data=payload, method="POST", headers={
+            "Authorization": f"Bearer {credentials.token}",
+            "Content-Type": "application/json",
+        })
         with urllib.request.urlopen(req, timeout=10):
             pass
+        print(f"Triggered job: mode={mode} channel={channel_id} project={project_query}")
     except Exception as e:
-        print(f"Error posting to response_url: {e}")
-
-
-def handle_analysis(response_url, channel_id):
-    try:
-        alerts = run_analysis(on_demand=True)
-        slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
-        if alerts:
-            post_alerts_to_slack(slack_client, channel_id, alerts, title="PM Watch (on-demand)")
-            if response_url:
-                post_to_response_url(response_url, f"Found {len(alerts)} item(s) — posted above.")
-        else:
-            msg = ":white_check_mark:  *All clear* — no issues found across active Skylark projects."
-            if response_url:
-                post_to_response_url(response_url, msg,
-                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": msg}}])
-            else:
-                post_freeform_to_slack(slack_client, channel_id, msg)
-    except Exception as e:
-        err = f":warning: PM Watch error: {e}"
-        if response_url:
-            post_to_response_url(response_url, err)
-        print(f"handle_analysis error: {e}")
-
-
-def handle_briefing(response_url, channel_id):
-    try:
-        text = run_briefing()
-        slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
-        post_freeform_to_slack(slack_client, channel_id, text, "Skylark PM Briefing")
-        if response_url:
-            post_to_response_url(response_url, "Briefing posted above.")
-    except Exception as e:
-        if response_url:
-            post_to_response_url(response_url, f":warning: Briefing error: {e}")
-        print(f"handle_briefing error: {e}")
-
-
-def handle_deep_dive(response_url, channel_id, project_query):
-    try:
-        text = run_deep_dive(project_query)
-        slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
-        post_freeform_to_slack(slack_client, channel_id, text, f"Deep dive: {project_query}")
-        if response_url:
-            post_to_response_url(response_url, "Deep dive posted above.")
-    except Exception as e:
-        if response_url:
-            post_to_response_url(response_url, f":warning: Deep dive error: {e}")
-        print(f"handle_deep_dive error: {e}")
+        print(f"Error triggering job: {e}")
 
 
 def parse_command(text):
     """
     Parse slash command text. Returns (mode, project_query).
-    Examples:
       ""              → ("analysis", None)
       "SKY-2446"      → ("deep_dive", "SKY-2446")
       "status 2446"   → ("deep_dive", "SKY-2446")
@@ -120,7 +88,6 @@ def parse_command(text):
     if text in ("BRIEFING", "MORNING", "SUMMARY", "REPORT"):
         return "briefing", None
 
-    # Match SKY-XXXX explicitly or just digits
     match = re.search(r'SKY-(\d+)', text)
     if not match:
         match = re.search(r'\b(\d{4,})\b', text)
@@ -142,7 +109,6 @@ def slack_command():
     if not verify_slack_signature(request):
         return jsonify({"error": "Invalid signature"}), 403
 
-    response_url = request.form.get("response_url")
     channel_id = request.form.get("channel_id")
     user_name = request.form.get("user_name", "Tyler")
     text = request.form.get("text", "")
@@ -150,19 +116,13 @@ def slack_command():
     mode, project_query = parse_command(text)
 
     if mode == "deep_dive":
-        ack = f":mag: Looking up *{project_query}*... full status report in ~30 seconds."
-        target = handle_deep_dive
-        args = (response_url, channel_id, project_query)
+        ack = f":mag: Looking up *{project_query}*... full status report in ~60 seconds."
     elif mode == "briefing":
-        ack = ":sunrise: Generating morning briefing... coming up in ~45 seconds."
-        target = handle_briefing
-        args = (response_url, channel_id)
+        ack = ":sunrise: Generating morning briefing... coming up in ~60 seconds."
     else:
-        ack = f":mag: On it, {user_name}. Scanning Basecamp... results in ~30 seconds."
-        target = handle_analysis
-        args = (response_url, channel_id)
+        ack = f":mag: On it, {user_name}. Scanning Basecamp... results in ~60 seconds."
 
-    threading.Thread(target=target, args=args, daemon=True).start()
+    trigger_job(mode, channel_id, project_query)
     return jsonify({"response_type": "in_channel", "text": ack})
 
 
@@ -186,19 +146,16 @@ def slack_events():
 
         if mode == "deep_dive":
             slack_client.chat_postMessage(channel=channel_id,
-                text=f":mag: Looking up *{project_query}*... full status in ~30 seconds.")
-            threading.Thread(target=handle_deep_dive,
-                args=(None, channel_id, project_query), daemon=True).start()
+                text=f":mag: Looking up *{project_query}*... full status in ~60 seconds.")
+            trigger_job(mode, channel_id, project_query)
         elif mode == "briefing":
             slack_client.chat_postMessage(channel=channel_id,
-                text=":sunrise: Generating briefing... ~45 seconds.")
-            threading.Thread(target=handle_briefing,
-                args=(None, channel_id), daemon=True).start()
+                text=":sunrise: Generating briefing... ~60 seconds.")
+            trigger_job(mode, channel_id)
         elif any(w in text.lower() for w in ["check", "status", "update", "run", "watch"]):
             slack_client.chat_postMessage(channel=channel_id,
-                text=":mag: Scanning Basecamp... ~30 seconds.")
-            threading.Thread(target=handle_analysis,
-                args=(None, channel_id), daemon=True).start()
+                text=":mag: Scanning Basecamp... ~60 seconds.")
+            trigger_job("analysis", channel_id)
 
     return jsonify({"ok": True})
 
