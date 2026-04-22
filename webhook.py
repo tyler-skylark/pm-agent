@@ -13,8 +13,6 @@ import re
 import time
 import urllib.request
 
-import google.auth
-import google.auth.transport.requests
 from flask import Flask, request, jsonify
 from slack_sdk import WebClient
 
@@ -39,13 +37,20 @@ def verify_slack_signature(req):
     return hmac.compare_digest(expected, req.headers.get("X-Slack-Signature", ""))
 
 
+def get_gcp_token():
+    """Get an access token from the GCP metadata server."""
+    meta_req = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    with urllib.request.urlopen(meta_req, timeout=5) as resp:
+        return json.loads(resp.read())["access_token"]
+
+
 def trigger_job(mode, channel_id, project_query=None):
     """Trigger the pm-agent Cloud Run Job with env overrides — runs independently."""
     try:
-        credentials, _ = google.auth.default(
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
-        )
-        credentials.refresh(google.auth.transport.requests.Request())
+        token = get_gcp_token()
 
         env = [
             {"name": "RUN_MODE", "value": mode},
@@ -60,15 +65,15 @@ def trigger_job(mode, channel_id, project_query=None):
         payload = json.dumps({
             "overrides": {"containerOverrides": [{"env": env}]}
         }).encode()
-        req = urllib.request.Request(url, data=payload, method="POST", headers={
-            "Authorization": f"Bearer {credentials.token}",
+        api_req = urllib.request.Request(url, data=payload, method="POST", headers={
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         })
-        with urllib.request.urlopen(req, timeout=10):
-            pass
-        print(f"Triggered job: mode={mode} channel={channel_id} project={project_query}")
+        with urllib.request.urlopen(api_req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            print(f"Triggered job: mode={mode} channel={channel_id} project={project_query} execution={result.get('name','?').split('/')[-1]}")
     except Exception as e:
-        print(f"Error triggering job: {e}")
+        print(f"ERROR triggering job mode={mode}: {e}")
 
 
 def parse_command(text):
