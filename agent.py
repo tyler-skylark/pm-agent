@@ -200,44 +200,50 @@ def fetch_active_sky_projects(projects):
 
 
 def fetch_todos_for_project(proj):
+    import re as _re
     proj_id = proj["id"]
     proj_name = proj["name"]
     todoset_tool = get_dock_tool(proj, "todoset")
     if not todoset_tool:
-        return [], []
+        return [], [], []
 
     todoset_id = todoset_tool["id"]
-    todolists = bc_get_data(f"/buckets/{proj_id}/todosets/{todoset_id}/todolists.json")
+    todolists = bc_get_all(f"/buckets/{proj_id}/todosets/{todoset_id}/todolists.json")
     if not todolists:
-        return [], []
+        return [], [], []
 
-    schedule_todos, labor_todos = [], []
-    for tlist in todolists[:12]:
+    schedule_todos, labor_todos, all_todos = [], [], []
+    for tlist in todolists:
         list_id = tlist["id"]
-        todos = bc_get_data(f"/buckets/{proj_id}/todolists/{list_id}/todos.json",
-                       {"completed": "false"})
-        for todo in (todos or [])[:25]:
+        list_name = tlist.get("name", "")
+        todos = bc_get_all(f"/buckets/{proj_id}/todolists/{list_id}/todos.json",
+                           {"completed": "false"})
+        for todo in (todos or []):
             title = todo.get("content", "")
             due = todo.get("due_on")
             assignees = [a.get("name") for a in todo.get("assignees", [])]
+            raw_desc = _re.sub(r'<[^>]+>', ' ', todo.get("description") or "").strip()
             entry = {
                 "project": proj_name,
                 "project_id": proj_id,
+                "list": list_name,
                 "title": title,
                 "due_on": due,
                 "assignees": assignees,
                 "app_url": todo.get("app_url"),
-                "description": (todo.get("description") or "")[:300],
+                "description": raw_desc[:600],
             }
+            all_todos.append(entry)
             if any(tag in title for tag in SCHED_TAGS):
                 schedule_todos.append(entry)
             if "[LABOR]" in title:
                 labor_todos.append(entry)
 
-    return schedule_todos, labor_todos
+    return schedule_todos, labor_todos, all_todos
 
 
-def fetch_messages_for_project(proj, since=None):
+def fetch_messages_for_project(proj):
+    import re as _re
     proj_id = proj["id"]
     proj_name = proj["name"]
     board_tool = get_dock_tool(proj, "message_board")
@@ -245,16 +251,10 @@ def fetch_messages_for_project(proj, since=None):
         return []
 
     board_id = board_tool["id"]
-    messages = bc_get_data(f"/buckets/{proj_id}/message_boards/{board_id}/messages.json")
+    messages = bc_get_all(f"/buckets/{proj_id}/message_boards/{board_id}/messages.json")
     result = []
-    for msg in (messages or [])[:8]:
-        created = msg.get("created_at", "")
-        if since and created < since:
-            continue
-        content = (msg.get("content") or "")
-        # Strip HTML tags roughly
-        import re
-        content = re.sub(r'<[^>]+>', ' ', content).strip()[:600]
+    for msg in (messages or []):
+        content = _re.sub(r'<[^>]+>', ' ', (msg.get("content") or "")).strip()[:1500]
         entry = {
             "project": proj_name,
             "type": "message",
@@ -262,29 +262,58 @@ def fetch_messages_for_project(proj, since=None):
             "title": msg.get("subject"),
             "content": content,
             "author": (msg.get("creator") or {}).get("name"),
-            "created_at": created,
+            "created_at": msg.get("created_at", ""),
             "app_url": msg.get("app_url"),
         }
         result.append(entry)
 
-        # Fetch comments on this message
         msg_id = msg.get("id")
-        comments = bc_get_data(f"/buckets/{proj_id}/recordings/{msg_id}/comments.json")
-        for comment in (comments or [])[:6]:
-            c_created = comment.get("created_at", "")
-            if since and c_created < since:
-                continue
-            c_content = re.sub(r'<[^>]+>', ' ', (comment.get("content") or "")).strip()[:300]
+        comments = bc_get_all(f"/buckets/{proj_id}/recordings/{msg_id}/comments.json")
+        for comment in (comments or []):
+            c_content = _re.sub(r'<[^>]+>', ' ', (comment.get("content") or "")).strip()[:800]
             result.append({
                 "project": proj_name,
                 "type": "comment",
                 "parent_title": msg.get("subject"),
                 "content": c_content,
                 "author": (comment.get("creator") or {}).get("name"),
-                "created_at": c_created,
+                "created_at": comment.get("created_at", ""),
                 "app_url": msg.get("app_url"),
             })
     return result
+
+
+def fetch_cards_for_project(proj):
+    import re as _re
+    proj_id = proj["id"]
+    proj_name = proj["name"]
+    card_tool = get_dock_tool(proj, "kanban_board")
+    if not card_tool:
+        return []
+
+    # Get card table columns
+    table_id = card_tool["id"]
+    table = bc_get_data(f"/buckets/{proj_id}/card_tables/{table_id}.json")
+    if not table:
+        return []
+
+    cards = []
+    for column in (table.get("lists") or []):
+        col_name = column.get("title", "")
+        col_cards = bc_get_all(f"/buckets/{proj_id}/card_tables/lists/{column['id']}/cards.json")
+        for card in (col_cards or []):
+            desc = _re.sub(r'<[^>]+>', ' ', (card.get("description") or "")).strip()[:800]
+            assignees = [a.get("name") for a in (card.get("assignees") or [])]
+            cards.append({
+                "project": proj_name,
+                "column": col_name,
+                "title": card.get("title", ""),
+                "due_on": card.get("due_on"),
+                "assignees": assignees,
+                "description": desc,
+                "app_url": card.get("app_url"),
+            })
+    return cards
 
 
 def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
@@ -326,47 +355,51 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
             })
 
     # Per-project data
-    all_schedule_todos, all_labor_todos, all_messages = [], [], []
+    all_schedule_todos, all_labor_todos, all_todos = [], [], []
+    all_messages, all_cards = [], []
     project_summaries = []
-    limit = 1 if mode == "deep_dive" else 20
+    projects_to_fetch = sky_projects[:1] if mode == "deep_dive" else sky_projects
 
-    for proj in sky_projects[:limit]:
+    for proj in projects_to_fetch:
         desc = proj.get("description", "")
         project_summaries.append({
             "id": proj["id"],
             "name": proj["name"],
-            "description": desc[:300],
+            "description": desc[:500],
         })
 
-        since_filter = last_run if mode == "analysis" else None
-        sched_todos, labor_todos = fetch_todos_for_project(proj)
-        messages = fetch_messages_for_project(proj, since=since_filter)
+        sched_todos, labor_todos, proj_todos = fetch_todos_for_project(proj)
+        messages = fetch_messages_for_project(proj)
+        cards = fetch_cards_for_project(proj)
 
         all_schedule_todos.extend(sched_todos)
         all_labor_todos.extend(labor_todos)
+        all_todos.extend(proj_todos)
         all_messages.extend(messages)
+        all_cards.extend(cards)
 
-    # Upcoming schedule entries (briefing/deep dive)
+    # Schedule entries
     schedule_entries = []
-    if mode in ("briefing", "deep_dive"):
-        for proj in sky_projects[:limit]:
-            sched_tool = get_dock_tool(proj, "schedule")
-            if sched_tool:
-                entries = bc_get_data(f"/buckets/{proj['id']}/schedules/{sched_tool['id']}/entries.json")
-                for e in (entries or [])[:5]:
-                    e["_project_name"] = proj["name"]
-                schedule_entries.extend((entries or [])[:5])
+    for proj in projects_to_fetch:
+        sched_tool = get_dock_tool(proj, "schedule")
+        if sched_tool:
+            entries = bc_get_all(f"/buckets/{proj['id']}/schedules/{sched_tool['id']}/entries.json")
+            for e in (entries or []):
+                e["_project_name"] = proj["name"]
+            schedule_entries.extend(entries or [])
 
     return {
         "mode": mode,
-        "recent_events": recent_events[:60] if mode == "analysis" else [],
-        "notifications": (notifications or [])[:30],
+        "recent_events": recent_events[:100] if mode == "analysis" else [],
+        "notifications": (notifications or [])[:50],
         "project_summaries": project_summaries,
-        "schedule_tagged_todos": all_schedule_todos[:80],
-        "labor_todos": all_labor_todos[:40],
-        "messages_and_comments": all_messages[:80],
-        "stale_projects": stale_projects[:20],
-        "upcoming_schedule_entries": schedule_entries[:30],
+        "schedule_tagged_todos": all_schedule_todos,
+        "labor_todos": all_labor_todos,
+        "all_todos": all_todos,
+        "messages_and_comments": all_messages,
+        "cards": all_cards,
+        "stale_projects": stale_projects,
+        "upcoming_schedule_entries": schedule_entries,
         "last_run": last_run,
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
@@ -500,6 +533,8 @@ def analyze_with_claude(anthropic_client, data_bundle):
 
 Today is {data_bundle['as_of'][:10]}.
 
+The data below includes EVERY active SKY project with ALL todos (all_todos), ALL messages and comments (messages_and_comments), ALL cards (cards), schedule entries, and labor todos. Use all of it.
+
 Review all active project data below and produce a clear morning briefing in Slack markdown.
 
 Format:
@@ -512,10 +547,10 @@ Use :red_circle: for high issues, :large_yellow_circle: for medium, :white_check
 Be specific — name the todo, the person, the date.
 
 --- DATA ---
-{json.dumps(data_bundle, indent=2)[:22000]}
+{json.dumps(data_bundle, indent=2)[:150000]}
 """
         response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=3000,
+            model="claude-sonnet-4-6", max_tokens=4000,
             messages=[{"role": "user", "content": prompt}],
         )
         return {"type": "briefing", "text": response.content[0].text.strip()}
@@ -528,31 +563,37 @@ Be specific — name the todo, the person, the date.
 
 As of {data_bundle['as_of'][:10]}.
 
+The data below includes EVERY todo, message, comment, card, and schedule entry for this project. Use all of it — don't skip anything.
+
 Cover:
 1. Project description fields (PM, Engineer, On-Site Lead, Client Contact)
 2. Current active phase (based on incomplete schedule-tagged todos with due dates)
-3. Upcoming milestones (next 30 days)
-4. Labor/travel status (any [LABOR] todos and their travel details)
-5. Recent messages/comments — tone, open questions, anything unresolved
-6. Any SOP violations or flags
-7. Overall health: GREEN / YELLOW / RED with one-line reason
+3. All open todos by list — who owns what, what's overdue, what's missing dates
+4. Upcoming milestones (next 30 days)
+5. Labor/travel status (any [LABOR] todos and their travel details)
+6. Card table status (if present — what's in each column, anything blocked or stale)
+7. Full message/comment thread review — tone, open questions, anything unresolved
+8. Any SOP violations or engineering milestone flags
+9. Overall health: GREEN / YELLOW / RED with one-line reason
 
-Use Slack markdown. Be specific and concise.
+Use Slack markdown. Be thorough — Tyler wants the full picture.
 
 --- DATA ---
-{json.dumps(data_bundle, indent=2)[:22000]}
+{json.dumps(data_bundle, indent=2)[:150000]}
 """
         response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=2500,
+            model="claude-sonnet-4-6", max_tokens=4000,
             messages=[{"role": "user", "content": prompt}],
         )
         return {"type": "deep_dive", "project": project_name, "text": response.content[0].text.strip()}
 
     else:
         # Standard hourly/on-demand alert analysis
-        prompt = f"""You are the PM Watch agent for Skylark AV. Review Basecamp activity since {since_str} and flag issues needing Tyler's attention.
+        prompt = f"""You are the PM Watch agent for Skylark AV. Review Basecamp data and flag issues needing Tyler's attention.
 
 {SKYLARK_SOP_CONTEXT}
+
+The data below includes ALL todos (all_todos), ALL messages and comments (messages_and_comments), ALL cards (cards), schedule entries, and labor todos across every active SKY project. Read all of it carefully.
 
 Flag these issues:
 1. **Upset / Frustrated** — tense tone in messages or comments (read the actual content)
@@ -562,6 +603,8 @@ Flag these issues:
 5. **Communication Gap** — client or team question unanswered for 24+ hours
 6. **Stale Project** — active-phase project with zero recent Basecamp activity
 7. **Closeout Overdue** — Client First Open passed >90 days ago, project not closed
+8. **Blocked / Stuck** — todo or card sitting in the same state with no activity, assignee missing, or description says waiting on something
+9. **Engineering Milestone Violation** — per the two-track milestone system, flag if wrong deliverable at wrong stage
 
 Only flag real issues. Skip LOI/Design-only projects for TBD fields.
 
@@ -577,10 +620,10 @@ Return ONLY a JSON array:
 If nothing needs attention, return [].
 
 --- DATA ---
-{json.dumps(data_bundle, indent=2)[:22000]}
+{json.dumps(data_bundle, indent=2)[:150000]}
 """
         response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=2500,
+            model="claude-sonnet-4-6", max_tokens=4000,
             messages=[{"role": "user", "content": prompt}],
         )
         text = response.content[0].text.strip()
