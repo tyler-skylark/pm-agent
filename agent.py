@@ -346,7 +346,7 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
 
     stale_projects = []
     for proj in sky_projects:
-        if "(LOI)" in proj["name"] or "(Design)" in proj["name"]:
+        if "(Design Contract)" in proj["name"]:
             continue
         if proj["id"] not in active_project_ids_in_events:
             stale_projects.append({
@@ -433,6 +433,11 @@ def deduplicate_alerts(alerts, state):
 SKYLARK_SOP_CONTEXT = """
 ## Skylark AV Operations Standards
 
+### Project Types
+Skylark has two types of SKY- projects:
+- **Design Contract** — pre-execution, design/engineering phase only. Project name includes "(Design Contract)". TBD fields are acceptable. Full SOP compliance (install scheduling, labor, procurement) is NOT expected.
+- **Standard Project** — full execution project. All description fields required, no TBDs, full SOP applies.
+
 ### Project Description (Required Fields)
 Every active SKY- project must have exactly these 5 fields in its description:
 - Client Contact
@@ -441,7 +446,7 @@ Every active SKY- project must have exactly these 5 fields in its description:
 - Engineer
 - On-Site Lead
 No dates are expected in the description. Dates live in schedule-tagged todos only.
-TBD is only acceptable for LOI-phase or Design-only projects.
+TBD is only acceptable for Design Contract projects (not Standard Projects).
 
 ### Schedule Tag System
 [PM-SCHED] [ENG-SCHED] [PROC-SCHED] [SHOP-SCHED] [LOG-SCHED] [ONS-SCHED] [COM-SCHED] [FUT-SCHED]
@@ -616,7 +621,7 @@ Flag these issues:
 8. **Blocked / Stuck** — todo or card sitting in the same state with no activity, assignee missing, or description says waiting on something
 9. **Engineering Milestone Violation** — per the two-track milestone system, flag if wrong deliverable at wrong stage
 
-Only flag real issues. Skip LOI/Design-only projects for TBD fields.
+Only flag real issues. Skip Design Contract projects for TBD field violations — those are pre-execution. Standard Projects must have all fields filled.
 
 Return ONLY a JSON array:
 [{{
