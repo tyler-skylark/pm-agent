@@ -514,15 +514,19 @@ GO/NO-GO check required 14 days AND 7 days before mobilization.
 No evidence of GO/NO-GO with [ONS-SCHED] due in <14 days = flag.
 
 ### Required Logistics Todos (Standard Projects with confirmed onsite date)
-Any Standard Project that has a non-TBD [ONS-SCHED] due date MUST have all three of these todos present with due dates set:
+Projects can have multiple onsite trips. Each confirmed [ONS-SCHED] todo (with a real due date, not TBD) represents one trip and requires its own complete set of three logistics todos.
+
+Rule: count the number of confirmed [ONS-SCHED] todos with due dates. That number = the required count of each of these todos:
 1. "Equipment/Materials Arrive Onsite [LOG-SCHED]"
 2. "Verify Equipment and Materials [LOG-SCHED]"
 3. "Return Trip to Home Shop (Excess Equipment/Materials) [LOG-SCHED]"
 
-Flag as "SOP Deviation" if any of these are:
-- Missing entirely from the project
-- Present but have no due_on date
-This check only applies to Standard Projects (not Design Contracts) where the onsite date is confirmed (not TBD).
+Example: 3 onsite trips → must have 3 of each logistics todo, all with due dates.
+
+Flag as "SOP Deviation" if:
+- The count of any logistics todo (present with a due date) is less than the number of confirmed [ONS-SCHED] todos
+- Any logistics todo is present but missing a due_on date
+This check only applies to Standard Projects (not Design Contracts).
 
 ### Communication Rules
 - Client posts → "Client Communication" board only
