@@ -513,6 +513,17 @@ Missing travel info on an upcoming trip = flag.
 GO/NO-GO check required 14 days AND 7 days before mobilization.
 No evidence of GO/NO-GO with [ONS-SCHED] due in <14 days = flag.
 
+### Required Logistics Todos (Standard Projects with confirmed onsite date)
+Any Standard Project that has a non-TBD [ONS-SCHED] due date MUST have all three of these todos present with due dates set:
+1. "Equipment/Materials Arrive Onsite [LOG-SCHED]"
+2. "Verify Equipment and Materials [LOG-SCHED]"
+3. "Return Trip to Home Shop (Excess Equipment/Materials) [LOG-SCHED]"
+
+Flag as "SOP Deviation" if any of these are:
+- Missing entirely from the project
+- Present but have no due_on date
+This check only applies to Standard Projects (not Design Contracts) where the onsite date is confirmed (not TBD).
+
 ### Communication Rules
 - Client posts → "Client Communication" board only
 - Internal updates → "Internal Coordination" board only
