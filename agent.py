@@ -525,6 +525,8 @@ def analyze_with_claude(anthropic_client, data_bundle):
     mode = data_bundle.get("mode", "analysis")
     last_run = data_bundle.get("last_run")
     since_str = last_run or "the past hour"
+    data_json = json.dumps(data_bundle, indent=2)[:150000]
+    print(f"analyze_with_claude: mode={mode} data_chars={len(data_json)}")
 
     if mode == "briefing":
         prompt = f"""You are the PM Watch agent for Skylark AV. Generate a morning briefing for Tyler (founder/owner).
@@ -547,12 +549,16 @@ Use :red_circle: for high issues, :large_yellow_circle: for medium, :white_check
 Be specific — name the todo, the person, the date.
 
 --- DATA ---
-{json.dumps(data_bundle, indent=2)[:150000]}
+{data_json}
 """
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        try:
+            response = anthropic_client.messages.create(
+                model="claude-sonnet-4-6", max_tokens=8000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as e:
+            print(f"Anthropic error (briefing): {type(e).__name__}: {e}")
+            raise
         return {"type": "briefing", "text": response.content[0].text.strip()}
 
     elif mode == "deep_dive":
@@ -579,12 +585,16 @@ Cover:
 Use Slack markdown. Be thorough — Tyler wants the full picture.
 
 --- DATA ---
-{json.dumps(data_bundle, indent=2)[:150000]}
+{data_json}
 """
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        try:
+            response = anthropic_client.messages.create(
+                model="claude-sonnet-4-6", max_tokens=8000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as e:
+            print(f"Anthropic error (deep_dive): {type(e).__name__}: {e}")
+            raise
         return {"type": "deep_dive", "project": project_name, "text": response.content[0].text.strip()}
 
     else:
@@ -620,12 +630,16 @@ Return ONLY a JSON array:
 If nothing needs attention, return [].
 
 --- DATA ---
-{json.dumps(data_bundle, indent=2)[:150000]}
+{data_json}
 """
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        try:
+            response = anthropic_client.messages.create(
+                model="claude-sonnet-4-6", max_tokens=4000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as e:
+            print(f"Anthropic error (analysis): {type(e).__name__}: {e}")
+            raise
         text = response.content[0].text.strip()
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0].strip()
@@ -670,8 +684,15 @@ def post_alerts_to_slack(slack_client, channel_id, alerts, title=None):
 
 
 def post_freeform_to_slack(slack_client, channel_id, text, fallback="PM Watch update"):
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-    slack_client.chat_postMessage(channel=channel_id, blocks=blocks, text=fallback)
+    # Slack section blocks cap at 3000 chars — split into multiple messages if needed
+    chunk_size = 2900
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    for i, chunk in enumerate(chunks):
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": chunk}}]
+        slack_client.chat_postMessage(
+            channel=channel_id, blocks=blocks,
+            text=fallback if i == 0 else f"{fallback} (cont.)",
+        )
 
 
 # ── Public API (used by webhook and job) ──────────────────────────────────────
