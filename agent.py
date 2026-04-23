@@ -612,7 +612,7 @@ Be specific — name the todo, the person, the date.
 """
         try:
             response = anthropic_client.messages.create(
-                model="claude-sonnet-4-6", max_tokens=8000,
+                model="claude-opus-4-7", max_tokens=8000,
                 messages=[{"role": "user", "content": prompt}],
             )
         except Exception as e:
@@ -648,7 +648,7 @@ Use Slack markdown. Be thorough — Tyler wants the full picture.
 """
         try:
             response = anthropic_client.messages.create(
-                model="claude-sonnet-4-6", max_tokens=8000,
+                model="claude-opus-4-7", max_tokens=8000,
                 messages=[{"role": "user", "content": prompt}],
             )
         except Exception as e:
@@ -694,7 +694,7 @@ If nothing needs attention, return [].
 """
         try:
             response = anthropic_client.messages.create(
-                model="claude-sonnet-4-6", max_tokens=4000,
+                model="claude-opus-4-7", max_tokens=4000,
                 messages=[{"role": "user", "content": prompt}],
             )
         except Exception as e:
