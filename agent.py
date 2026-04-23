@@ -199,18 +199,44 @@ def fetch_active_sky_projects(projects):
     ]
 
 
+REQUIRED_CLIENT_VISIBLE_LISTS = {"Onsite Phase", "Commissioning Phase", "Closeout Phase"}
+
+
 def fetch_todos_for_project(proj):
     import re as _re
     proj_id = proj["id"]
     proj_name = proj["name"]
     todoset_tool = get_dock_tool(proj, "todoset")
     if not todoset_tool:
-        return [], [], []
+        return [], [], [], []
 
     todoset_id = todoset_tool["id"]
     todolists = bc_get_all(f"/buckets/{proj_id}/todosets/{todoset_id}/todolists.json")
     if not todolists:
-        return [], [], []
+        return [], [], [], []
+
+    # Check which lists are client-visible
+    client_recordings = bc_get_all(f"/buckets/{proj_id}/client/recordings.json")
+    client_visible_ids = {r.get("id") for r in (client_recordings or [])}
+
+    existing_list_names = {tlist.get("name", "") for tlist in todolists}
+    client_visibility_issues = []
+    for required_name in REQUIRED_CLIENT_VISIBLE_LISTS:
+        if required_name not in existing_list_names:
+            client_visibility_issues.append({
+                "project": proj_name,
+                "list": required_name,
+                "issue": "missing_list",
+            })
+        else:
+            tlist_obj = next((t for t in todolists if t.get("name") == required_name), None)
+            if tlist_obj and tlist_obj.get("id") not in client_visible_ids:
+                client_visibility_issues.append({
+                    "project": proj_name,
+                    "list": required_name,
+                    "issue": "not_client_visible",
+                    "app_url": tlist_obj.get("app_url"),
+                })
 
     schedule_todos, labor_todos, all_todos = [], [], []
     for tlist in todolists:
@@ -239,7 +265,7 @@ def fetch_todos_for_project(proj):
             if "[LABOR]" in title:
                 labor_todos.append(entry)
 
-    return schedule_todos, labor_todos, all_todos
+    return schedule_todos, labor_todos, all_todos, client_visibility_issues
 
 
 def fetch_messages_for_project(proj):
@@ -356,19 +382,21 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
 
     # Per-project data
     all_schedule_todos, all_labor_todos, all_todos = [], [], []
-    all_messages, all_cards = [], []
+    all_messages, all_cards, all_client_visibility_issues = [], [], []
     project_summaries = []
     projects_to_fetch = sky_projects[:1] if mode == "deep_dive" else sky_projects
 
     for proj in projects_to_fetch:
         desc = proj.get("description", "")
+        is_design_contract = "(Design Contract)" in proj.get("name", "")
         project_summaries.append({
             "id": proj["id"],
             "name": proj["name"],
             "description": desc[:500],
+            "type": "Design Contract" if is_design_contract else "Standard Project",
         })
 
-        sched_todos, labor_todos, proj_todos = fetch_todos_for_project(proj)
+        sched_todos, labor_todos, proj_todos, client_vis_issues = fetch_todos_for_project(proj)
         messages = fetch_messages_for_project(proj)
         cards = fetch_cards_for_project(proj)
 
@@ -377,6 +405,8 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
         all_todos.extend(proj_todos)
         all_messages.extend(messages)
         all_cards.extend(cards)
+        if not is_design_contract:
+            all_client_visibility_issues.extend(client_vis_issues)
 
     # Schedule entries
     schedule_entries = []
@@ -398,6 +428,7 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
         "all_todos": all_todos,
         "messages_and_comments": all_messages,
         "cards": all_cards,
+        "client_visibility_issues": all_client_visibility_issues,
         "stale_projects": stale_projects,
         "upcoming_schedule_entries": schedule_entries,
         "last_run": last_run,
@@ -508,6 +539,14 @@ Key terms:
 [LABOR] todos: format = "Name | Role | Status [LABOR]"
 Description must have Flights, Hotel, Per-Diem, Car Rental filled in.
 Missing travel info on an upcoming trip = flag.
+
+### Required Client-Visible Todo Lists (Standard Projects only)
+These three todo lists MUST be set to "The client sees this" on every Standard Project:
+- Onsite Phase
+- Commissioning Phase
+- Closeout Phase
+
+The data bundle includes a `client_visibility_issues` array. Each entry has `project`, `list`, and `issue` ("not_client_visible" or "missing_list"). Any entry in this array = flag immediately as "Client Visibility" SOP violation.
 
 ### Pre-Mobilization Gate
 GO/NO-GO check required 14 days AND 7 days before mobilization.
@@ -635,12 +674,13 @@ Flag these issues:
 7. **Closeout Overdue** — Client First Open passed >90 days ago, project not closed
 8. **Blocked / Stuck** — todo or card sitting in the same state with no activity, assignee missing, or description says waiting on something
 9. **Engineering Milestone Violation** — per the two-track milestone system, flag if wrong deliverable at wrong stage
+10. **Client Visibility** — any entry in `client_visibility_issues` means a required list (Onsite Phase, Commissioning Phase, or Closeout Phase) is either missing or not set to client-visible
 
 Only flag real issues. Skip Design Contract projects for TBD field violations — those are pre-execution. Standard Projects must have all fields filled.
 
 Return ONLY a JSON array:
 [{{
-  "category": "Upset Team Member | Missing Dates | SOP Deviation | Schedule Risk | Communication Gap | Stale Project | Closeout Overdue",
+  "category": "Upset Team Member | Missing Dates | SOP Deviation | Schedule Risk | Communication Gap | Stale Project | Closeout Overdue | Client Visibility",
   "severity": "high | medium | low",
   "description": "1-2 sentences. Name the project, todo, person, and timing.",
   "url": "basecamp app_url or null",
