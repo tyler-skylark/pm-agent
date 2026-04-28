@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Skylark PM Watch Agent
+Skylark Rick Stamen PM Agent
 Features: hourly alerts, morning briefing, deep dive, deduplication, stale detection
 """
 
@@ -206,12 +206,17 @@ def fetch_todos_for_project(proj):
     import re as _re
     proj_id = proj["id"]
     proj_name = proj["name"]
-    todoset_tool = get_dock_tool(proj, "todoset")
-    if not todoset_tool:
+    todoset_tools = [d for d in proj.get("dock", [])
+                     if d.get("name") == "todoset" and d.get("enabled")]
+    if not todoset_tools:
         return [], [], [], []
 
-    todoset_id = todoset_tool["id"]
-    todolists = bc_get_all(f"/buckets/{proj_id}/todosets/{todoset_id}/todolists.json")
+    todolists = []
+    for ts in todoset_tools:
+        tl = bc_get_all(f"/buckets/{proj_id}/todosets/{ts['id']}/todolists.json")
+        for t in (tl or []):
+            t["_todoset_title"] = ts.get("title", "")
+        todolists.extend(tl or [])
     if not todolists:
         return [], [], [], []
 
@@ -242,19 +247,30 @@ def fetch_todos_for_project(proj):
     for tlist in todolists:
         list_id = tlist["id"]
         list_name = tlist.get("name", "")
-        todos = bc_get_all(f"/buckets/{proj_id}/todolists/{list_id}/todos.json",
-                           {"completed": "false"})
-        for todo in (todos or []):
+        open_todos = bc_get_all(f"/buckets/{proj_id}/todolists/{list_id}/todos.json",
+                                {"completed": "false"}) or []
+        done_todos = bc_get_all(f"/buckets/{proj_id}/todolists/{list_id}/todos.json",
+                                {"completed": "true"}) or []
+        for todo in open_todos + done_todos:
             title = todo.get("content", "")
             due = todo.get("due_on")
+            starts = todo.get("starts_on")
+            completed = bool(todo.get("completed"))
             assignees = [a.get("name") for a in todo.get("assignees", [])]
             raw_desc = _re.sub(r'<[^>]+>', ' ', todo.get("description") or "").strip()
             entry = {
                 "project": proj_name,
                 "project_id": proj_id,
+                "todoset": tlist.get("_todoset_title", ""),
                 "list": list_name,
                 "title": title,
+                "starts_on": starts,
                 "due_on": due,
+                "completed": completed,
+                "completed_at": todo.get("completion", {}).get("created_at") if completed else None,
+                "created_at": todo.get("created_at"),
+                "updated_at": todo.get("updated_at"),
+                "comments_count": todo.get("comments_count", 0),
                 "assignees": assignees,
                 "app_url": todo.get("app_url"),
                 "description": raw_desc[:600],
@@ -272,39 +288,83 @@ def fetch_messages_for_project(proj):
     import re as _re
     proj_id = proj["id"]
     proj_name = proj["name"]
-    board_tool = get_dock_tool(proj, "message_board")
-    if not board_tool:
+    board_tools = [d for d in proj.get("dock", [])
+                   if d.get("name") == "message_board" and d.get("enabled")]
+    if not board_tools:
         return []
 
-    board_id = board_tool["id"]
-    messages = bc_get_all(f"/buckets/{proj_id}/message_boards/{board_id}/messages.json")
     result = []
-    for msg in (messages or []):
-        content = _re.sub(r'<[^>]+>', ' ', (msg.get("content") or "")).strip()[:1500]
+    for board_tool in board_tools:
+        board_id = board_tool["id"]
+        board_title = board_tool.get("title", "")
+        messages = bc_get_all(f"/buckets/{proj_id}/message_boards/{board_id}/messages.json")
+        for msg in (messages or []):
+            content = _re.sub(r'<[^>]+>', ' ', (msg.get("content") or "")).strip()[:1500]
+            entry = {
+                "project": proj_name,
+                "type": "message",
+                "board": board_title,
+                "title": msg.get("subject"),
+                "content": content,
+                "author": (msg.get("creator") or {}).get("name"),
+                "created_at": msg.get("created_at", ""),
+                "app_url": msg.get("app_url"),
+            }
+            result.append(entry)
+
+            msg_id = msg.get("id")
+            comments = bc_get_all(f"/buckets/{proj_id}/recordings/{msg_id}/comments.json")
+            for comment in (comments or []):
+                c_content = _re.sub(r'<[^>]+>', ' ', (comment.get("content") or "")).strip()[:800]
+                result.append({
+                    "project": proj_name,
+                    "type": "comment",
+                    "board": board_title,
+                    "parent_title": msg.get("subject"),
+                    "content": c_content,
+                    "author": (comment.get("creator") or {}).get("name"),
+                    "created_at": comment.get("created_at", ""),
+                    "app_url": msg.get("app_url"),
+                })
+    return result
+
+
+def fetch_inbox_forwards_for_project(proj):
+    import re as _re
+    proj_id = proj["id"]
+    proj_name = proj["name"]
+    inbox_tool = get_dock_tool(proj, "inbox")
+    if not inbox_tool:
+        return []
+
+    forwards = bc_get_all(f"/buckets/{proj_id}/inbox_forwards.json")
+    result = []
+    for fwd in (forwards or []):
+        content = _re.sub(r'<[^>]+>', ' ', (fwd.get("content") or "")).strip()[:1500]
         entry = {
             "project": proj_name,
-            "type": "message",
-            "board": board_tool.get("title", ""),
-            "title": msg.get("subject"),
+            "type": "email_forward",
+            "title": fwd.get("subject") or fwd.get("title"),
             "content": content,
-            "author": (msg.get("creator") or {}).get("name"),
-            "created_at": msg.get("created_at", ""),
-            "app_url": msg.get("app_url"),
+            "from": fwd.get("from"),
+            "author": (fwd.get("creator") or {}).get("name"),
+            "created_at": fwd.get("created_at", ""),
+            "app_url": fwd.get("app_url"),
         }
         result.append(entry)
 
-        msg_id = msg.get("id")
-        comments = bc_get_all(f"/buckets/{proj_id}/recordings/{msg_id}/comments.json")
+        fwd_id = fwd.get("id")
+        comments = bc_get_all(f"/buckets/{proj_id}/recordings/{fwd_id}/comments.json")
         for comment in (comments or []):
             c_content = _re.sub(r'<[^>]+>', ' ', (comment.get("content") or "")).strip()[:800]
             result.append({
                 "project": proj_name,
-                "type": "comment",
-                "parent_title": msg.get("subject"),
+                "type": "email_forward_comment",
+                "parent_title": fwd.get("subject") or fwd.get("title"),
                 "content": c_content,
                 "author": (comment.get("creator") or {}).get("name"),
                 "created_at": comment.get("created_at", ""),
-                "app_url": msg.get("app_url"),
+                "app_url": fwd.get("app_url"),
             })
     return result
 
@@ -340,6 +400,215 @@ def fetch_cards_for_project(proj):
                 "app_url": card.get("app_url"),
             })
     return cards
+
+
+# ── Google Drive job-folder audit ──────────────────────────────────────────────
+
+DRIVE_JOBS_ROOT_ID = os.environ.get("DRIVE_JOBS_ROOT_ID", "1DiI7KOS6pjiXQclLhepBAiy9q-K2vvEB")
+
+DRIVE_REQUIRED_LAYOUT = {
+    "Contract Docs": ["BOM", "Contract Revisions", "Insurance Documents",
+                      "Packing Slips", "Purchase Orders", "Signed Contracts"],
+    "Engineering": ["Client Supplied Documents", "Equipment Config Files",
+                    "Onsite Pictures", "PatchCAD", "PDF", "Pull Sheets",
+                    "Renders", "Sketchup", "Skylark DWG", "Soundvision",
+                    "Vectorworks", "Vision"],
+    "Proposals": ["Archives"],
+    "Vendor Docs": [],
+}
+
+DRIVE_FOLDER_ALIASES = {
+    "Contract Docs": ["Contracts", "Contract Documents"],
+    "Engineering": ["Eng", "Engineering Docs"],
+    "Proposals": ["Proposal", "Quotes"],
+    "Vendor Docs": ["Vendor", "Vendor Documents", "Vendors"],
+    "Insurance Documents": ["Insurance Docs", "Insurance", "COI", "Insurance Certificates"],
+    "Signed Contracts": ["Signed Documents", "Signed", "Executed Contracts", "Signed Contract"],
+    "Purchase Orders": ["POs", "PO", "Purchase Order"],
+    "Packing Slips": ["Packing Slip", "Shipping"],
+    "Contract Revisions": ["Revisions", "Contract Drafts"],
+    "BOM": ["BOMs", "Bill of Materials"],
+    "Skylark DWG": ["Skylark Drawings", "DWG"],
+    "Onsite Pictures": ["Onsite Photos", "Site Photos", "Jobsite Photos"],
+    "Client Supplied Documents": ["Client Docs", "Client Supplied"],
+    "Equipment Config Files": ["Config Files", "Configs"],
+    "Pull Sheets": ["Pullsheets", "Pull Lists"],
+    "Archives": ["Archive", "Old"],
+}
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+def _folder_matches(expected, actual_names):
+    """Return the matched actual-folder name, or None. Case-insensitive, checks aliases."""
+    norm = {n.lower(): n for n in actual_names}
+    if expected.lower() in norm:
+        return norm[expected.lower()]
+    for alias in DRIVE_FOLDER_ALIASES.get(expected, []):
+        if alias.lower() in norm:
+            return norm[alias.lower()]
+    return None
+
+
+def get_drive_service():
+    try:
+        from googleapiclient.discovery import build
+        import google.auth
+        creds, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        print(f"Drive init skipped: {type(e).__name__}: {e}")
+        return None
+
+
+def drive_list_children(svc, folder_id):
+    try:
+        res = svc.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id,name,mimeType,modifiedTime,size)",
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+            pageSize=500,
+        ).execute()
+        return res.get("files") or []
+    except Exception as e:
+        print(f"Drive list {folder_id} failed: {type(e).__name__}: {e}")
+        return []
+
+
+def drive_find_install_share(svc, sky_id):
+    q = f"mimeType='{FOLDER_MIME}' and name contains '{sky_id}' and trashed=false"
+    try:
+        res = svc.files().list(
+            q=q, fields="files(id,name,parents,modifiedTime)",
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+            corpora="allDrives", pageSize=20,
+        ).execute()
+        files = res.get("files") or []
+        ranked = sorted(files, key=lambda f: (
+            0 if f["name"].upper().startswith(sky_id.upper()) else 1,
+            0 if "Install Share" in f["name"] else 1,
+            len(f["name"]),
+        ))
+        return ranked
+    except Exception as e:
+        print(f"Drive search {sky_id} failed: {type(e).__name__}: {e}")
+        return []
+
+
+def drive_scan_tree(svc, folder_id, max_depth=3, file_limit_per_folder=25, _depth=0):
+    """Shallow-to-medium tree scan. Returns dict of {name: {type, modified, size?, children?}}."""
+    if _depth >= max_depth:
+        return {"_truncated_depth": True}
+
+    children = drive_list_children(svc, folder_id)
+    out = {}
+    file_count = 0
+    for c in children:
+        name = c["name"]
+        is_folder = c["mimeType"] == FOLDER_MIME
+        if not is_folder:
+            file_count += 1
+            if file_count > file_limit_per_folder:
+                out["_more_files_truncated"] = True
+                continue
+        node = {"type": "folder" if is_folder else "file",
+                "modified": (c.get("modifiedTime") or "")[:10]}
+        if not is_folder and c.get("size"):
+            node["size"] = c["size"]
+        if is_folder and _depth + 1 < max_depth:
+            node["children"] = drive_scan_tree(svc, c["id"], max_depth,
+                                               file_limit_per_folder, _depth + 1)
+        out[name] = node
+    return out
+
+
+def audit_drive_folder(svc, proj):
+    import re as _re
+    m = _re.match(r'(SKY-\d+)', proj.get("name", ""))
+    if not m:
+        return None
+    sky_id = m.group(1)
+
+    hits = drive_find_install_share(svc, sky_id)
+    if not hits:
+        return {"sky": sky_id, "project": proj["name"],
+                "issues": ["no_drive_folder_found"]}
+
+    issues = []
+    if len(hits) > 1:
+        issues.append(f"multiple_drive_folders_for_sky ({len(hits)})")
+
+    project_folder = hits[0]
+    project_folder_id = project_folder["id"]
+
+    children = drive_list_children(svc, project_folder_id)
+    child_folder_items = {c["name"]: c for c in children if c["mimeType"] == FOLDER_MIME}
+    top_names = list(child_folder_items.keys())
+
+    missing_top, matched_top = [], {}
+    for expected in DRIVE_REQUIRED_LAYOUT:
+        match = _folder_matches(expected, top_names)
+        if match:
+            matched_top[expected] = match
+        else:
+            missing_top.append(expected)
+
+    missing_nested, empty_top = [], []
+    for expected, subs in DRIVE_REQUIRED_LAYOUT.items():
+        actual_name = matched_top.get(expected)
+        if not actual_name:
+            continue
+        parent = child_folder_items[actual_name]
+        nested = drive_list_children(svc, parent["id"])
+        if not nested:
+            empty_top.append(expected)
+            continue
+        nested_folder_names = [c["name"] for c in nested if c["mimeType"] == FOLDER_MIME]
+        for sub in subs:
+            if _folder_matches(sub, nested_folder_names):
+                continue
+            missing_nested.append(f"{expected}/{sub}")
+
+    days_stale = None
+    try:
+        mt = project_folder.get("modifiedTime", "")
+        if mt:
+            dt = datetime.fromisoformat(mt.replace("Z", "+00:00"))
+            days_stale = (datetime.now(timezone.utc) - dt).days
+    except Exception:
+        pass
+
+    tree = drive_scan_tree(svc, project_folder_id, max_depth=3)
+
+    return {
+        "sky": sky_id,
+        "project": proj["name"],
+        "drive_project_folder": project_folder["name"],
+        "missing_top_folders": missing_top,
+        "missing_nested_folders": missing_nested,
+        "empty_top_folders": empty_top,
+        "days_since_drive_modified": days_stale,
+        "matched_aliases": {k: v for k, v in matched_top.items() if k != v},
+        "tree": tree,
+        "issues": issues,
+        "note": "Use `tree` to reason about real-world naming. Folders / files that don't match the template exactly may still satisfy the intent (e.g. 'Insurance Docs' = 'Insurance Documents', a loose 'Contract SEC Video System.pdf' in Contract Revisions = signed contract on file).",
+    }
+
+
+def audit_drive_for_projects(sky_projects):
+    svc = get_drive_service()
+    if not svc:
+        return []
+    out = []
+    for proj in sky_projects:
+        try:
+            r = audit_drive_folder(svc, proj)
+            if r:
+                out.append(r)
+        except Exception as e:
+            print(f"Drive audit {proj.get('name')} failed: {type(e).__name__}: {e}")
+    return out
 
 
 def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
@@ -394,16 +663,31 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
             "name": proj["name"],
             "description": desc[:500],
             "type": "Design Contract" if is_design_contract else "Standard Project",
+            "app_url": proj.get("app_url"),
         })
 
         sched_todos, labor_todos, proj_todos, client_vis_issues = fetch_todos_for_project(proj)
         messages = fetch_messages_for_project(proj)
+        email_forwards = fetch_inbox_forwards_for_project(proj)
         cards = fetch_cards_for_project(proj)
+
+        # For briefing/analysis (cross-project): trim to keep token budget sane.
+        # Deep-dive (single project) keeps everything.
+        if mode in ("briefing", "analysis"):
+            from datetime import timedelta as _td
+            cutoff_msg = (datetime.now(timezone.utc) - _td(days=30)).isoformat()
+            cutoff_done = (datetime.now(timezone.utc) - _td(days=14)).isoformat()
+            messages = [m for m in messages if m.get("created_at", "") >= cutoff_msg]
+            email_forwards = [m for m in email_forwards if m.get("created_at", "") >= cutoff_msg]
+            proj_todos = [t for t in proj_todos
+                          if not t.get("completed")
+                          or (t.get("completed_at") or "") >= cutoff_done]
 
         all_schedule_todos.extend(sched_todos)
         all_labor_todos.extend(labor_todos)
         all_todos.extend(proj_todos)
         all_messages.extend(messages)
+        all_messages.extend(email_forwards)
         all_cards.extend(cards)
         if not is_design_contract:
             all_client_visibility_issues.extend(client_vis_issues)
@@ -418,6 +702,8 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
                 e["_project_name"] = proj["name"]
             schedule_entries.extend(entries or [])
 
+    drive_compliance = audit_drive_for_projects(projects_to_fetch)
+
     return {
         "mode": mode,
         "recent_events": recent_events[:100] if mode == "analysis" else [],
@@ -431,6 +717,7 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
         "client_visibility_issues": all_client_visibility_issues,
         "stale_projects": stale_projects,
         "upcoming_schedule_entries": schedule_entries,
+        "drive_compliance": drive_compliance,
         "last_run": last_run,
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
@@ -482,6 +769,19 @@ TBD is only acceptable for Design Contract projects (not Standard Projects).
 ### Schedule Tag System
 [PM-SCHED] [ENG-SCHED] [PROC-SCHED] [SHOP-SCHED] [LOG-SCHED] [ONS-SCHED] [COM-SCHED] [FUT-SCHED]
 CRITICAL: Any incomplete schedule-tagged todo WITHOUT a due_on date = missing_dates flag.
+
+### Date Ranges on Todos (CRITICAL — read this carefully)
+Basecamp todos can have a date range, not just a single due date. Each todo has TWO date fields:
+- `starts_on` — the FIRST day of the range (null if no range)
+- `due_on` — the LAST day (also used for single-date todos when there's no range)
+
+How to interpret:
+- If `starts_on` is null → single-date todo, `due_on` is the date.
+- If `starts_on` is set → it's a RANGE. The trip/phase BEGINS on `starts_on` and ENDS on `due_on`.
+
+This matters most for `[ONS-SCHED]` install trips. Example: an install todo with `starts_on: 2026-04-25` and `due_on: 2026-05-01` means the install RUNS from April 25 through May 1 — Apr 25 is when crew mobilizes, May 1 is the LAST day onsite. Reporting "install begins 5/1" in this case is wrong; the install ends 5/1.
+
+Always state ranges as "Apr 25 – May 1" or "from 4/25, ends 5/1". Never collapse a range to a single date. When computing "days out" or "begins in N days", base it on `starts_on` if present, otherwise `due_on`.
 
 ### Engineering Milestone System
 Engineering runs two coordinated tracks: Construction DD/CD and AV Systems.
@@ -536,9 +836,18 @@ Key terms:
 - Project Closed [PM-SCHED]: 90 days after open
 
 ### Labor Scheduling
-[LABOR] todos: format = "Name | Role | Status [LABOR]"
+[LABOR] todos live in the **Labor Scheduling** todoset. Format: "Name | Role | Status [LABOR]".
 Description must have Flights, Hotel, Per-Diem, Car Rental filled in.
 Missing travel info on an upcoming trip = flag.
+
+EVERY confirmed [ONS-SCHED] onsite trip MUST have corresponding [LABOR] todos documenting who is going onsite for that trip. This is non-negotiable — onsite work without documented labor = SOP violation.
+
+Rule: for each [ONS-SCHED] trip with a real due date, there must be at least one [LABOR] todo in the Labor Scheduling todoset that covers that trip's date range. Tie the labor to the trip by date proximity (the [LABOR] dates should overlap or align with the [ONS-SCHED] trip date).
+
+Flag if:
+- A confirmed [ONS-SCHED] trip has zero [LABOR] todos covering it
+- A [LABOR] todo is missing the Flights/Hotel/Per-Diem/Car Rental fields when the trip is within 14 days
+- A [LABOR] todo exists but has no due date or assignee
 
 ### Required Client-Visible Todo Lists (Standard Projects only)
 These three todo lists MUST be set to "The client sees this" on every Standard Project:
@@ -567,6 +876,42 @@ Flag as "SOP Deviation" if:
 - Any logistics todo is present but missing a due_on date
 This check only applies to Standard Projects (not Design Contracts).
 
+### Onsite "Attention Needed" List (Field RFIs)
+Inside the **Onsite Tasks** todoset there is a todolist called **"Attention Needed"**. These are field RFIs / problems raised by the install team that need fast resolution.
+
+Rule: any open todo in the "Attention Needed" list whose `updated_at` is more than **24 hours** old (no comments, status change, or assignment update in 24h) = flag as a stale field RFI.
+
+Use `updated_at` (last touched) — not `created_at`. A field RFI created 3 days ago but updated this morning is fine; one created today but untouched for 25 hours is not.
+
+When flagging, include:
+- The todo title
+- Project (SKY-XXXX)
+- Hours since last activity (round to whole hours)
+- Assignee, if any (no assignee on a stale field RFI is a worse flag)
+- The app_url so Tyler can jump straight to it
+
+Tyler wants these surfaced proactively in any briefing or per-project review — they should never sit without follow-up.
+
+### Onsite Trip Companion Items (Standard Projects)
+Every confirmed [ONS-SCHED] installation trip should be followed by these companion items, all on the project schedule:
+- A **Commissioning** task (typically [COM-SCHED]) — system commissioning after install
+- **Client Training** — as needed for the scope (cameras, audio, lighting, control surfaces, etc.)
+- A **Punch List Walkthrough** [PM-SCHED] — 48 hours before end of install (per Closeout SOP)
+
+Flag if an [ONS-SCHED] install trip has no following commissioning todo, no training todo (where the scope clearly calls for it), or no punch list walkthrough scheduled.
+
+### Punch List Phase Detection & Client Visibility
+A project enters the **Punch List Phase** when there is an [ONS-SCHED] todo whose title contains "Installation (Punch List)" or "Punch List" (e.g. `Installation (Punch List) [ONS-SCHED]`).
+
+When in Punch List Phase:
+1. ALL remaining open punch list items in the **Onsite Tasks**, **Engineering Tasks**, and **Commissioning Tasks** todosets must be MOVED to the **Closeout Tasks** todoset (not duplicated — moved).
+2. The Closeout list containing these items must be set to client-visible ("The client sees this") so the client can track punch list progress.
+3. Items still sitting in Onsite/Engineering/Commissioning during punch list phase = SOP deviation. Flag each one specifically with its title, current todoset, and the action needed ("move to Closeout").
+
+Use the `todoset` field on each todo to determine where it currently lives. If a todo's title or description references a punch-list-style item (touch-ups, corrections, deficiencies, list of items the client called out) and it's still in Onsite/Engineering/Commissioning while the project is in Punch List Phase → flag.
+
+Tyler wants Rick to call these out proactively when reviewing a project that's in the punch list phase.
+
 ### Communication Rules
 - Client posts → "Client Communication" board only
 - Internal updates → "Internal Coordination" board only
@@ -575,6 +920,24 @@ This check only applies to Standard Projects (not Design Contracts).
 ### Closeout
 Project is overdue for closure if "Client First Open [PM-SCHED]" passed >90 days ago
 and "Project Closed in Basecamp [PM-SCHED]" is still incomplete.
+
+### Google Drive Job Folder Compliance
+Every Standard Project should have a Google Drive project folder named `SKY-XXXX ...` (inside the client's folder under Skylark Jobs). Inside that project folder, the template is: `Contract Docs`, `Engineering`, `Proposals`, `Vendor Docs` (each with specific required subfolders).
+
+The data bundle includes `drive_compliance` per project. Each entry has:
+- `missing_top_folders` / `missing_nested_folders` — deterministic misses after alias matching
+- `empty_top_folders` — folder exists but has no contents
+- `matched_aliases` — where an alias was used (e.g. "Insurance Documents" matched "Insurance Docs")
+- `tree` — the actual folder + file structure (2-3 levels deep). Use this to reason beyond the template.
+- `days_since_drive_modified` — staleness signal
+
+REAL-WORLD RULE: The template is a guide, not a contract. Before flagging something missing, look at `tree` and ask "is there functional evidence this requirement is met?" Examples:
+- Template wants `Signed Contracts/` but `tree` shows `Contract Revisions/` contains `Contract SEC Video System.pdf` and a `Signed Documents/` subfolder — that IS the signed contract on file. Don't flag.
+- Template wants `Insurance Documents/` but `tree` shows `Insurance Docs/` with a COI PDF inside — same thing. Don't flag.
+- Template wants `Onsite Pictures/` but `tree` shows empty `Onsite Photos/` — flag as empty if the project is past the onsite phase.
+- Template wants `Signed Contracts/` and NOTHING in `tree` looks like a contract document — flag it, this is a real gap.
+
+Cross-reference against Basecamp phase. Missing a signed contract on a design-phase project is normal. Missing it on a project already in onsite phase is a red flag.
 """
 
 
@@ -584,11 +947,17 @@ def analyze_with_claude(anthropic_client, data_bundle):
     mode = data_bundle.get("mode", "analysis")
     last_run = data_bundle.get("last_run")
     since_str = last_run or "the past hour"
-    data_json = json.dumps(data_bundle, indent=2)[:150000]
-    print(f"analyze_with_claude: mode={mode} data_chars={len(data_json)}")
+    full_data_json = json.dumps(data_bundle, indent=2)
+    DATA_LIMIT = 500000
+    truncated = len(full_data_json) > DATA_LIMIT
+    data_json = full_data_json[:DATA_LIMIT]
+    if truncated:
+        data_json += "\n\n[DATA TRUNCATED — original was {full} chars, kept {kept}]".format(
+            full=len(full_data_json), kept=DATA_LIMIT)
+    print(f"analyze_with_claude: mode={mode} data_chars_full={len(full_data_json)} kept={len(data_json)} truncated={truncated}")
 
     if mode == "briefing":
-        prompt = f"""You are the PM Watch agent for Skylark AV. Generate a morning briefing for Tyler (founder/owner).
+        prompt = f"""You are Rick Stamen, the PM agent for Skylark AV. Generate a morning briefing for Tyler (founder/owner).
 
 {SKYLARK_SOP_CONTEXT}
 
@@ -607,6 +976,8 @@ Format:
 Use :red_circle: for high issues, :large_yellow_circle: for medium, :white_check_mark: for clear.
 Be specific — name the todo, the person, the date.
 
+ALWAYS render every project name as a clickable Slack link using the project's `app_url` from `project_summaries`. Format: `<APP_URL|SKY-XXXX>` — angle brackets, URL, pipe, display text. Never write a bare `SKY-XXXX` when an app_url is available. This applies to every mention in every section: headers, bullets, inline references. Tyler should be able to click any project name to jump straight to it.
+
 --- DATA ---
 {data_json}
 """
@@ -622,7 +993,7 @@ Be specific — name the todo, the person, the date.
 
     elif mode == "deep_dive":
         project_name = (data_bundle.get("project_summaries") or [{}])[0].get("name", "Unknown")
-        prompt = f"""You are the PM Watch agent for Skylark AV. Give Tyler a full status report on {project_name}.
+        prompt = f"""You are Rick Stamen, the PM agent for Skylark AV. Give Tyler a full status report on {project_name}.
 
 {SKYLARK_SOP_CONTEXT}
 
@@ -643,6 +1014,8 @@ Cover:
 
 Use Slack markdown. Be thorough — Tyler wants the full picture.
 
+Render the project name in the report header as a clickable Slack link using its `app_url` from `project_summaries`. Format: `<APP_URL|SKY-XXXX>`. Same rule for any other project you reference — make every SKY mention clickable.
+
 --- DATA ---
 {data_json}
 """
@@ -658,7 +1031,7 @@ Use Slack markdown. Be thorough — Tyler wants the full picture.
 
     else:
         # Standard hourly/on-demand alert analysis
-        prompt = f"""You are the PM Watch agent for Skylark AV. Review Basecamp data and flag issues needing Tyler's attention.
+        prompt = f"""You are Rick Stamen, the PM agent for Skylark AV. Review Basecamp data and flag issues needing Tyler's attention.
 
 {SKYLARK_SOP_CONTEXT}
 
@@ -683,8 +1056,9 @@ Return ONLY a JSON array:
   "category": "Upset Team Member | Missing Dates | SOP Deviation | Schedule Risk | Communication Gap | Stale Project | Closeout Overdue | Client Visibility",
   "severity": "high | medium | low",
   "description": "1-2 sentences. Name the project, todo, person, and timing.",
-  "url": "basecamp app_url or null",
-  "project": "SKY-XXXX project name or null"
+  "url": "basecamp app_url for the specific todo/message/card, or null",
+  "project": "SKY-XXXX project name or null",
+  "project_url": "the project's app_url from project_summaries, or null"
 }}]
 
 If nothing needs attention, return [].
@@ -719,14 +1093,20 @@ SEVERITY_EMOJI = {"high": ":red_circle:", "medium": ":large_yellow_circle:", "lo
 
 def post_alerts_to_slack(slack_client, channel_id, alerts, title=None):
     now = datetime.now().strftime("%b %d, %I:%M %p")
-    header = title or f"PM Watch  —  {now}"
+    header = title or f"Rick Stamen  —  {now}"
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": header}},
         {"type": "divider"},
     ]
     for alert in alerts:
         emoji = SEVERITY_EMOJI.get(alert.get("severity", "low"), ":large_blue_circle:")
-        project_line = f"\n_Project: {alert['project']}_" if alert.get("project") else ""
+        if alert.get("project"):
+            if alert.get("project_url"):
+                project_line = f"\n_Project: <{alert['project_url']}|{alert['project']}>_"
+            else:
+                project_line = f"\n_Project: {alert['project']}_"
+        else:
+            project_line = ""
         text = f"{emoji}  *{alert['category']}*{project_line}\n{alert['description']}"
         section = {"type": "section", "text": {"type": "mrkdwn", "text": text}}
         if alert.get("url"):
@@ -739,11 +1119,11 @@ def post_alerts_to_slack(slack_client, channel_id, alerts, title=None):
         blocks.append({"type": "divider"})
     slack_client.chat_postMessage(
         channel=channel_id, blocks=blocks,
-        text=f"PM Watch: {len(alerts)} alert(s) need your attention",
+        text=f"Rick Stamen: {len(alerts)} alert(s) need your attention",
     )
 
 
-def post_freeform_to_slack(slack_client, channel_id, text, fallback="PM Watch update"):
+def post_freeform_to_slack(slack_client, channel_id, text, fallback="Rick Stamen update"):
     # Slack section blocks cap at 3000 chars — split into multiple messages if needed
     chunk_size = 2900
     chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
@@ -849,7 +1229,7 @@ def main():
         print(f"Found {len(alerts)} new alert(s)")
         if alerts:
             try:
-                title = "PM Watch (on-demand)" if on_demand else "PM Watch"
+                title = "Rick Stamen (on-demand)" if on_demand else "Rick Stamen"
                 post_alerts_to_slack(slack_client, channel_id, alerts, title=title)
                 print(f"Posted {len(alerts)} alert(s) to Slack")
             except SlackApiError as e:

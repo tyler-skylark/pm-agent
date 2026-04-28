@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PM Watch Slack webhook
+Rick Stamen Slack webhook
 Handles /pmwatch slash command and DMs.
 Triggers the pm-agent Cloud Run Job for all long-running work.
 """
@@ -18,11 +18,16 @@ from slack_sdk import WebClient
 
 from agent import load_env, load_secrets_from_gcp
 
+load_env()
+load_secrets_from_gcp()
+
 app = Flask(__name__)
 
 GCP_PROJECT = "skylark-pm-agents"
 GCP_REGION = "us-central1"
 JOB_NAME = "pm-agent"
+PM_WATCH_CHANNEL = os.environ.get("PM_WATCH_CHANNEL_ID", "C0AU5J6SKQS")
+_seen_event_ids = set()
 
 
 def verify_slack_signature(req):
@@ -141,27 +146,38 @@ def slack_events():
     if not verify_slack_signature(request):
         return jsonify({"error": "Invalid signature"}), 403
 
+    if request.headers.get("X-Slack-Retry-Num"):
+        return jsonify({"ok": True})
+
+    event_id = data.get("event_id")
+    if event_id:
+        if event_id in _seen_event_ids:
+            return jsonify({"ok": True})
+        _seen_event_ids.add(event_id)
+        if len(_seen_event_ids) > 1000:
+            _seen_event_ids.clear()
+
     event = data.get("event", {})
-    if event.get("type") in ("message", "app_mention") and not event.get("bot_id"):
-        text = event.get("text", "")
-        channel_id = event.get("channel")
-        mode, project_query = parse_command(text)
+    if event.get("bot_id") or event.get("subtype") == "bot_message":
+        return jsonify({"ok": True})
 
-        slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
+    if event.get("type") not in ("message", "app_mention"):
+        return jsonify({"ok": True})
 
-        if mode == "deep_dive":
-            slack_client.chat_postMessage(channel=channel_id,
-                text=f":mag: Looking up *{project_query}*... full status in ~60 seconds.")
-            trigger_job(mode, channel_id, project_query)
-        elif mode == "briefing":
-            slack_client.chat_postMessage(channel=channel_id,
-                text=":sunrise: Generating briefing... ~60 seconds.")
-            trigger_job(mode, channel_id)
-        elif any(w in text.lower() for w in ["check", "status", "update", "run", "watch"]):
-            slack_client.chat_postMessage(channel=channel_id,
-                text=":mag: Scanning Basecamp... ~60 seconds.")
-            trigger_job("analysis", channel_id)
+    channel_id = event.get("channel")
+    text = event.get("text", "")
+    thread_ts = event.get("thread_ts")
+    event_ts = event.get("ts")
+    is_dm = event.get("channel_type") == "im"
+    in_pm_watch = channel_id == PM_WATCH_CHANNEL
+    is_mention = event.get("type") == "app_mention"
 
+    if not (in_pm_watch or is_dm or is_mention):
+        return jsonify({"ok": True})
+
+    print(f"chat event: type={event.get('type')} channel={channel_id} thread_ts={thread_ts} event_ts={event_ts} dm={is_dm} mention={is_mention}")
+    from chat import spawn_chat
+    spawn_chat(text, channel_id, thread_ts, event_ts)
     return jsonify({"ok": True})
 
 
