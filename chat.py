@@ -333,17 +333,25 @@ def _build_message_history(slack, channel_id, thread_ts, fallback_text):
         resp = slack.conversations_replies(channel=channel_id, ts=thread_ts, limit=THREAD_HISTORY_LIMIT)
         raw = resp.get("messages", [])
         print(f"chat: pulled {len(raw)} thread messages for ts={thread_ts}")
+        ack_set = set(ACK_PHRASES)
         msgs = []
+        skipped_acks = 0
         for m in raw:
             text = m.get("text", "").strip()
             if not text:
                 continue
+            is_bot = bool(m.get("bot_id"))
+            if is_bot and text in ack_set:
+                skipped_acks += 1
+                continue
             text = re.sub(r'<@[A-Z0-9]+>', '', text).strip()
-            role = "assistant" if m.get("bot_id") else "user"
+            role = "assistant" if is_bot else "user"
             if msgs and msgs[-1]["role"] == role:
                 msgs[-1]["content"] += "\n" + text
             else:
                 msgs.append({"role": role, "content": text})
+        if skipped_acks:
+            print(f"chat: filtered {skipped_acks} ack message(s) from history")
         if not msgs or msgs[-1]["role"] != "user":
             msgs.append({"role": "user", "content": fallback_text})
         print(f"chat: built {len(msgs)} turns, last role={msgs[-1]['role']}, last preview={msgs[-1]['content'][:100]!r}")

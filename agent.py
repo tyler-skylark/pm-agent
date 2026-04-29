@@ -11,8 +11,12 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+PROJECT_FETCH_WORKERS = 4
+TODOLIST_FETCH_WORKERS = 4
 
 import anthropic
 from slack_sdk import WebClient
@@ -211,12 +215,15 @@ def fetch_todos_for_project(proj):
     if not todoset_tools:
         return [], [], [], []
 
+    def _fetch_todoset_lists(ts):
+        return ts, bc_get_all(f"/buckets/{proj_id}/todosets/{ts['id']}/todolists.json")
+
     todolists = []
-    for ts in todoset_tools:
-        tl = bc_get_all(f"/buckets/{proj_id}/todosets/{ts['id']}/todolists.json")
-        for t in (tl or []):
-            t["_todoset_title"] = ts.get("title", "")
-        todolists.extend(tl or [])
+    with ThreadPoolExecutor(max_workers=TODOLIST_FETCH_WORKERS) as pool:
+        for ts, tl in pool.map(_fetch_todoset_lists, todoset_tools):
+            for t in (tl or []):
+                t["_todoset_title"] = ts.get("title", "")
+            todolists.extend(tl or [])
     if not todolists:
         return [], [], [], []
 
@@ -243,14 +250,20 @@ def fetch_todos_for_project(proj):
                     "app_url": tlist_obj.get("app_url"),
                 })
 
+    def _fetch_list_todos(tlist):
+        lid = tlist["id"]
+        open_t = bc_get_all(f"/buckets/{proj_id}/todolists/{lid}/todos.json",
+                            {"completed": "false"}) or []
+        done_t = bc_get_all(f"/buckets/{proj_id}/todolists/{lid}/todos.json",
+                            {"completed": "true"}) or []
+        return tlist, open_t, done_t
+
     schedule_todos, labor_todos, all_todos = [], [], []
-    for tlist in todolists:
-        list_id = tlist["id"]
+    with ThreadPoolExecutor(max_workers=TODOLIST_FETCH_WORKERS) as pool:
+        list_results = list(pool.map(_fetch_list_todos, todolists))
+
+    for tlist, open_todos, done_todos in list_results:
         list_name = tlist.get("name", "")
-        open_todos = bc_get_all(f"/buckets/{proj_id}/todolists/{list_id}/todos.json",
-                                {"completed": "false"}) or []
-        done_todos = bc_get_all(f"/buckets/{proj_id}/todolists/{list_id}/todos.json",
-                                {"completed": "true"}) or []
         for todo in open_todos + done_todos:
             title = todo.get("content", "")
             due = todo.get("due_on")
@@ -655,7 +668,33 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
     project_summaries = []
     projects_to_fetch = sky_projects[:1] if mode == "deep_dive" else sky_projects
 
-    for proj in projects_to_fetch:
+    def _fetch_project_bundle(proj):
+        sched_t, labor_t, proj_t, vis = fetch_todos_for_project(proj)
+        msgs = fetch_messages_for_project(proj)
+        emails = fetch_inbox_forwards_for_project(proj)
+        cards_p = fetch_cards_for_project(proj)
+        sched_entries = []
+        sched_tool = get_dock_tool(proj, "schedule")
+        if sched_tool:
+            sched_entries = bc_get_all(
+                f"/buckets/{proj['id']}/schedules/{sched_tool['id']}/entries.json"
+            ) or []
+            for e in sched_entries:
+                e["_project_name"] = proj["name"]
+        return proj, sched_t, labor_t, proj_t, vis, msgs, emails, cards_p, sched_entries
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=PROJECT_FETCH_WORKERS) as pool:
+        bundles = list(pool.map(_fetch_project_bundle, projects_to_fetch))
+    print(f"Fetched {len(bundles)} projects in {(time.perf_counter() - t0):.1f}s")
+
+    schedule_entries = []
+    cutoff_msg = cutoff_done = None
+    if mode in ("briefing", "analysis"):
+        cutoff_msg = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        cutoff_done = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+
+    for proj, sched_todos, labor_todos, proj_todos, client_vis_issues, messages, email_forwards, cards, sched_entries in bundles:
         desc = proj.get("description", "")
         is_design_contract = "(Design Contract)" in proj.get("name", "")
         project_summaries.append({
@@ -666,17 +705,7 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
             "app_url": proj.get("app_url"),
         })
 
-        sched_todos, labor_todos, proj_todos, client_vis_issues = fetch_todos_for_project(proj)
-        messages = fetch_messages_for_project(proj)
-        email_forwards = fetch_inbox_forwards_for_project(proj)
-        cards = fetch_cards_for_project(proj)
-
-        # For briefing/analysis (cross-project): trim to keep token budget sane.
-        # Deep-dive (single project) keeps everything.
-        if mode in ("briefing", "analysis"):
-            from datetime import timedelta as _td
-            cutoff_msg = (datetime.now(timezone.utc) - _td(days=30)).isoformat()
-            cutoff_done = (datetime.now(timezone.utc) - _td(days=14)).isoformat()
+        if cutoff_msg:
             messages = [m for m in messages if m.get("created_at", "") >= cutoff_msg]
             email_forwards = [m for m in email_forwards if m.get("created_at", "") >= cutoff_msg]
             proj_todos = [t for t in proj_todos
@@ -689,18 +718,9 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
         all_messages.extend(messages)
         all_messages.extend(email_forwards)
         all_cards.extend(cards)
+        schedule_entries.extend(sched_entries)
         if not is_design_contract:
             all_client_visibility_issues.extend(client_vis_issues)
-
-    # Schedule entries
-    schedule_entries = []
-    for proj in projects_to_fetch:
-        sched_tool = get_dock_tool(proj, "schedule")
-        if sched_tool:
-            entries = bc_get_all(f"/buckets/{proj['id']}/schedules/{sched_tool['id']}/entries.json")
-            for e in (entries or []):
-                e["_project_name"] = proj["name"]
-            schedule_entries.extend(entries or [])
 
     drive_compliance = audit_drive_for_projects(projects_to_fetch)
 
@@ -891,6 +911,24 @@ When flagging, include:
 - The app_url so Tyler can jump straight to it
 
 Tyler wants these surfaced proactively in any briefing or per-project review — they should never sit without follow-up.
+
+### Onsite Orders Phase (Procurement Mode Switch)
+"Onsite Orders" is a procurement phase trigger, not a regular task. It's a single todo (typically a `[PROC-SCHED]` item titled "Onsite Orders" or similar) whose due date is set ~2 weeks before the first onsite/install date. While this todo is open, procurement documents and tracks orders differently — anything ordered during the install window flows through the Onsite Orders process.
+
+Lifecycle:
+- Created as part of the project schedule template
+- Due date = approximately 14 days before the [ONS-SCHED] install start date
+- INTENTIONALLY stays OPEN from its due date through the entire onsite window
+- Checked off ONLY after the crew has pulled off the job (onsite work fully complete)
+
+Flag if:
+- A Standard Project has an [ONS-SCHED] install starting within 21 days but no Onsite Orders todo exists at all (missing template item).
+- An Onsite Orders todo exists but has no due_on date.
+- Onsite Orders due_on is more than ~21 days before the [ONS-SCHED] install start (way too early — likely scheduled wrong).
+- Onsite Orders is marked complete BEFORE the install team has pulled off (i.e. before the last [ONS-SCHED] day, or before the corresponding Commissioning/Closeout items are done) — that's premature closure and breaks the procurement tracking window.
+- Onsite Orders is still open more than 30 days after the install was supposed to end — closeout cleanup needed.
+
+DO NOT flag a still-open Onsite Orders todo during the onsite window as "overdue" — that's the expected state. The whole point is that it stays open while crew is in the field.
 
 ### Onsite Trip Companion Items (Standard Projects)
 Every confirmed [ONS-SCHED] installation trip should be followed by these companion items, all on the project schedule:
@@ -1123,10 +1161,40 @@ def post_alerts_to_slack(slack_client, channel_id, alerts, title=None):
     )
 
 
+def split_for_slack(text, max_size=2900):
+    """Split long Slack mrkdwn text without breaking link tokens.
+
+    Slack section blocks cap at 3000 chars. A naive split mid-string can
+    cleave `<URL|display>` link syntax in half, leaving raw URLs visible.
+    We prefer paragraph/line/word breaks and back off to before any
+    unmatched `<` so links stay intact.
+    """
+    chunks = []
+    while len(text) > max_size:
+        cut = max_size
+        for delim in ("\n\n", "\n", " "):
+            idx = text.rfind(delim, 0, max_size)
+            if idx >= max_size // 2:
+                cut = idx
+                break
+        head = text[:cut]
+        last_open = head.rfind("<")
+        last_close = head.rfind(">")
+        if last_open > last_close:
+            # cursor lands inside a Slack link token — back up to before it
+            ws = max(text.rfind(" ", 0, last_open), text.rfind("\n", 0, last_open))
+            cut = ws + 1 if ws >= 0 else last_open
+        if cut <= 0:
+            cut = max_size  # malformed text, fall back to hard split
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text.strip():
+        chunks.append(text)
+    return chunks
+
+
 def post_freeform_to_slack(slack_client, channel_id, text, fallback="Rick Stamen update"):
-    # Slack section blocks cap at 3000 chars — split into multiple messages if needed
-    chunk_size = 2900
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    chunks = split_for_slack(text)
     for i, chunk in enumerate(chunks):
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": chunk}}]
         slack_client.chat_postMessage(
