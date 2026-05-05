@@ -16,9 +16,11 @@ import anthropic
 from slack_sdk import WebClient
 
 from agent import (
+    DRIVE_JOBS_ROOT_ID,
     SKYLARK_SOP_CONTEXT,
     audit_drive_folder,
     bc_get_all,
+    drive_find_project_folder,
     fetch_active_sky_projects,
     fetch_cards_for_project,
     fetch_inbox_forwards_for_project,
@@ -82,9 +84,24 @@ def _build_system_prompt():
 
 CURRENT DATE/TIME: {_now_cst_string()} (Skylark HQ is on Central Time). Use this for ALL date math — "tomorrow", "next week", "overdue", "X days from now". Don't guess; the timestamp above is authoritative for this turn.
 
-You have read-only access to Basecamp projects and the Skylark Google Drive job folders. You can also trigger the three scheduled jobs (briefing, analysis, deep dive) which post their output as separate messages.
+You have read-only access to Basecamp projects and the Skylark Google Drive job folders. You can also trigger background jobs (briefing, analysis, deep dive, drive audit) which post their output as separate messages.
 
-When a user asks for "a briefing" or "full status," call `trigger_briefing`. When they ask about a specific SKY project ("how is SKY-2446 doing?"), either answer directly from `get_project_details` for a quick read, or call `trigger_deep_dive` for a full written report (takes ~5 min, posts separately).
+When a user asks for "a briefing" or "full status," call `trigger_briefing`. When they ask about a specific SKY project ("how is SKY-2446 doing?"), either answer directly from `get_project_details` for a quick read, or call `trigger_deep_dive` for a full written report (takes ~5 min, posts separately). When they ask "do a drive audit", "check the drive", "are all the drive folders set up" or similar cross-project Drive questions, call `trigger_drive_audit`.
+
+When Tyler asks what you can do, what you help with, what your capabilities are, or anything similar — answer directly in-thread (don't trigger a job). Give a short, scannable list. Use this canonical menu (keep the wording tight, you can adapt voice but not content):
+
+> *What I do, in short:*
+> • *Morning briefing* — full health summary across every active SKY project. Ask "give me a briefing" or "morning briefing".
+> • *Deep dive* on one project — full status report (open/closed todos, schedule, labor, messages, cards, Drive folder). Ask "deep dive SKY-2446" or "full status on SKY-2446".
+> • *Quick read* on one project — fast in-thread answer, no separate post. Ask "how is SKY-2446 doing?" or "what's the status of SKY-2446".
+> • *Drive audit* — sweep every project's Google Drive folder for missing/empty/misnamed folders. Ask "drive audit" or "check the drive".
+> • *Drive lookup* on one project — show me which Drive folder a SKY-id resolves to, plus all candidates. Ask "where is the Drive folder for SKY-2429".
+> • *Find a todo* — search across all projects by keyword, optionally filter by assignee or project. Ask "any todos about L-Acoustics?" or "show me Sarah's overdue items".
+> • *Issue scan* — flag new SOP/schedule/communication issues since the last hourly run. Ask "scan for issues" or "what's broken right now".
+>
+> Everything is read-only — I don't write to Basecamp.
+
+Keep that menu in mind so the answer is consistent every time. If Tyler asks specifically about ONE capability ("what's a deep dive?"), expand on that one without repeating the whole menu.
 
 Schedule data lives in TWO places — check both before claiming a project has no schedule:
 - `schedule_tagged_todos` — todos tagged with [PM-SCHED], [ENG-SCHED], etc. (the SOP convention)
@@ -130,7 +147,18 @@ CHAT_TOOLS = [
     },
     {
         "name": "get_drive_compliance",
-        "description": "Audit the Google Drive job folder for one SKY project. Returns missing folders, empty required folders, and days-since-modified.",
+        "description": "Audit the Google Drive job folder for one SKY project. Returns the resolved folder path/url plus missing folders, empty required folders, and days-since-modified. Call this whenever Tyler asks about a project's status — Drive holds the contract, drawings, and field photos that Basecamp doesn't.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sky_id": {"type": "string"},
+            },
+            "required": ["sky_id"],
+        },
+    },
+    {
+        "name": "find_drive_folder",
+        "description": "Diagnose Drive lookup for a SKY project. Returns every candidate folder Drive returned for the SKY-id, the full parent path of each, whether each is under the Skylark jobs root, and which one the audit would pick. Use this when Tyler asks why Drive data is missing or when get_drive_compliance returns no_drive_folder_found.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -159,6 +187,11 @@ CHAT_TOOLS = [
             },
             "required": ["sky_id"],
         },
+    },
+    {
+        "name": "trigger_drive_audit",
+        "description": "Kick off a Google Drive audit across EVERY active SKY project. Reports missing folders, empty required folders, naming/layout issues, and zero-candidate projects. Posts separately to #pm-watch when complete (~3 min). Use when Tyler asks for 'a drive audit', 'check the drive', 'are all the drive folders set up', or similar cross-project Drive questions.",
+        "input_schema": {"type": "object", "properties": {}},
     },
 ]
 
@@ -275,6 +308,31 @@ def tool_get_drive_compliance(sky_id):
     return audit_drive_folder(svc, proj) or {"error": "No audit data returned"}
 
 
+def tool_find_drive_folder(sky_id):
+    m = re.match(r'(SKY-?\d+)', sky_id.upper())
+    if not m:
+        return {"error": "sky_id must look like SKY-2429"}
+    sky = m.group(1).replace("SKY", "SKY-").replace("--", "-")
+    svc = get_drive_service()
+    if not svc:
+        return {"error": "Drive service unavailable — check service account permissions."}
+    hits = drive_find_project_folder(svc, sky)
+    if not hits:
+        return {"sky": sky, "candidates": [], "chosen": None,
+                "note": "No Drive folder whose name contains this SKY-id was found anywhere in Drive."}
+    candidates = [{
+        "name": h["name"],
+        "id": h["id"],
+        "path": h.get("_path", "?"),
+        "url": f"https://drive.google.com/drive/folders/{h['id']}",
+        "under_jobs_root": DRIVE_JOBS_ROOT_ID in {fid for fid, _ in h.get("_chain", [])},
+        "modified": (h.get("modifiedTime") or "")[:10],
+    } for h in hits]
+    chosen = candidates[0]
+    return {"sky": sky, "candidates": candidates, "chosen": chosen,
+            "jobs_root_id": DRIVE_JOBS_ROOT_ID}
+
+
 def tool_trigger_briefing():
     _trigger_job_external("briefing")
     return {"ok": True, "message": "Briefing job triggered — will post separately in ~5 min."}
@@ -294,6 +352,11 @@ def tool_trigger_deep_dive(sky_id):
     return {"ok": True, "message": f"Deep dive on {query} triggered — will post separately in ~5 min."}
 
 
+def tool_trigger_drive_audit():
+    _trigger_job_external("drive_audit")
+    return {"ok": True, "message": "Drive audit job triggered — full Drive sweep across all active projects, will post separately in ~3 min."}
+
+
 def _trigger_job_external(mode, project_query=None):
     """Import lazily to avoid webhook → chat circular import."""
     from webhook import trigger_job
@@ -306,9 +369,11 @@ TOOL_DISPATCH = {
     "get_project_details": lambda sky_id_or_name, **_: tool_get_project_details(sky_id_or_name),
     "search_todos": lambda query, project=None, assignee=None, **_: tool_search_todos(query, project, assignee),
     "get_drive_compliance": lambda sky_id, **_: tool_get_drive_compliance(sky_id),
+    "find_drive_folder": lambda sky_id, **_: tool_find_drive_folder(sky_id),
     "trigger_briefing": lambda **_: tool_trigger_briefing(),
     "trigger_analysis": lambda **_: tool_trigger_analysis(),
     "trigger_deep_dive": lambda sky_id, **_: tool_trigger_deep_dive(sky_id),
+    "trigger_drive_audit": lambda **_: tool_trigger_drive_audit(),
 }
 
 

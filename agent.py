@@ -489,7 +489,43 @@ def drive_list_children(svc, folder_id):
         return []
 
 
-def drive_find_install_share(svc, sky_id):
+def drive_get_parent_chain(svc, folder_id, max_depth=10):
+    """Walk up from folder_id, return list of (id, name) leaf-first."""
+    chain = []
+    current = folder_id
+    for _ in range(max_depth):
+        try:
+            f = svc.files().get(
+                fileId=current, fields="id,name,parents",
+                supportsAllDrives=True,
+            ).execute()
+        except Exception as e:
+            print(f"Drive parent walk failed at {current}: {type(e).__name__}: {e}")
+            break
+        chain.append((f["id"], f.get("name", "?")))
+        parents = f.get("parents") or []
+        if not parents:
+            break
+        current = parents[0]
+    return chain
+
+
+DRIVE_JOBS_ROOT_NAMES = ("Skylark Jobs",)
+DRIVE_NESTED_PENALTY_TOKENS = (
+    "vendor docs", "damaged", "archive", "archived", "old", "backup",
+    "install share", "share folder", "shared",
+)
+
+
+def drive_find_project_folder(svc, sky_id):
+    """Find the SKY-XXXX project root folder.
+
+    Strategy: search all of Drive for folders whose name contains the SKY-id,
+    then for each candidate walk its parent chain. Project root folders sit
+    directly under "Skylark Jobs > <Client>" — i.e. the SHALLOWEST candidate
+    that's a child of a "Skylark Jobs" ancestor wins. Deep matches (under
+    Vendor Docs, Damaged Product, Install Share Folder, etc.) are penalized.
+    """
     q = f"mimeType='{FOLDER_MIME}' and name contains '{sky_id}' and trashed=false"
     try:
         res = svc.files().list(
@@ -498,15 +534,53 @@ def drive_find_install_share(svc, sky_id):
             corpora="allDrives", pageSize=20,
         ).execute()
         files = res.get("files") or []
-        ranked = sorted(files, key=lambda f: (
-            0 if f["name"].upper().startswith(sky_id.upper()) else 1,
-            0 if "Install Share" in f["name"] else 1,
-            len(f["name"]),
-        ))
-        return ranked
     except Exception as e:
         print(f"Drive search {sky_id} failed: {type(e).__name__}: {e}")
         return []
+
+    if not files:
+        print(f"Drive {sky_id}: 0 candidates")
+        return []
+
+    print(f"Drive {sky_id}: {len(files)} candidate(s)")
+
+    under_root, outside_root = [], []
+    for f in files:
+        chain = drive_get_parent_chain(svc, f["id"])
+        f["_chain"] = chain
+        path_str = " > ".join(n for _, n in reversed(chain))
+        f["_path"] = path_str
+        f["_depth"] = max(len(chain) - 1, 0)
+        ancestor_ids = {fid for fid, _ in chain}
+        ancestor_names_lower = {n.lower() for _, n in chain}
+        path_lower = path_str.lower()
+        nested_penalty = sum(1 for tok in DRIVE_NESTED_PENALTY_TOKENS if tok in path_lower)
+        f["_nested_penalty"] = nested_penalty
+        in_jobs_root = (
+            DRIVE_JOBS_ROOT_ID in ancestor_ids
+            or any(n.lower() in ancestor_names_lower for n in DRIVE_JOBS_ROOT_NAMES)
+        )
+        bucket = under_root if in_jobs_root else outside_root
+        bucket.append(f)
+        marker = "ok " if in_jobs_root else "off"
+        print(f"  {marker} depth={f['_depth']} pen={nested_penalty} {f['name']!r}  path={path_str}")
+
+    pool = under_root or outside_root
+    if not under_root:
+        print(f"Drive {sky_id}: no hit under jobs root, falling back to global")
+
+    ranked = sorted(pool, key=lambda f: (
+        f.get("_nested_penalty", 0),
+        f.get("_depth", 99),
+        0 if f["name"].upper().startswith(sky_id.upper()) else 1,
+        len(f["name"]),
+    ))
+    print(f"Drive {sky_id} chose: {ranked[0]['name']!r}  path={ranked[0].get('_path','?')}")
+    return ranked
+
+
+# Backwards-compatible alias (older callers)
+drive_find_install_share = drive_find_project_folder
 
 
 def drive_scan_tree(svc, folder_id, max_depth=3, file_limit_per_folder=25, _depth=0):
@@ -554,6 +628,17 @@ def audit_drive_folder(svc, proj):
 
     project_folder = hits[0]
     project_folder_id = project_folder["id"]
+    drive_path = project_folder.get("_path") or project_folder["name"]
+    drive_url = f"https://drive.google.com/drive/folders/{project_folder_id}"
+    chain = project_folder.get("_chain", [])
+    chain_ids = {fid for fid, _ in chain}
+    chain_names_lower = {n.lower() for _, n in chain}
+    under_root = (
+        DRIVE_JOBS_ROOT_ID in chain_ids
+        or any(n.lower() in chain_names_lower for n in DRIVE_JOBS_ROOT_NAMES)
+    )
+    if not under_root:
+        issues.append("drive_folder_outside_jobs_root")
 
     children = drive_list_children(svc, project_folder_id)
     child_folder_items = {c["name"]: c for c in children if c["mimeType"] == FOLDER_MIME}
@@ -598,6 +683,8 @@ def audit_drive_folder(svc, proj):
         "sky": sky_id,
         "project": proj["name"],
         "drive_project_folder": project_folder["name"],
+        "drive_path": drive_path,
+        "drive_url": drive_url,
         "missing_top_folders": missing_top,
         "missing_nested_folders": missing_nested,
         "empty_top_folders": empty_top,
@@ -962,12 +1049,20 @@ and "Project Closed in Basecamp [PM-SCHED]" is still incomplete.
 ### Google Drive Job Folder Compliance
 Every Standard Project should have a Google Drive project folder named `SKY-XXXX ...` (inside the client's folder under Skylark Jobs). Inside that project folder, the template is: `Contract Docs`, `Engineering`, `Proposals`, `Vendor Docs` (each with specific required subfolders).
 
+ALWAYS check Drive when you discuss a project's status. Drive holds the contract, engineering drawings, vendor quotes, and field photos that Basecamp doesn't — a status read with no Drive context is incomplete. If `drive_compliance` is in the bundle, use it. If you're answering interactively and you don't have it, call `get_drive_compliance` for the project first; if that returns `no_drive_folder_found` or looks wrong, call `find_drive_folder` to see every candidate folder and where it sits in Drive — that tells you whether the folder is genuinely missing, mis-named, or living outside the Skylark Jobs root.
+
 The data bundle includes `drive_compliance` per project. Each entry has:
+- `drive_project_folder` — name of the resolved project folder
+- `drive_path` — full Drive path from the root (e.g. "Skylark Jobs > Lakepointe > SKY-2429 ...")
+- `drive_url` — direct link to the project folder
 - `missing_top_folders` / `missing_nested_folders` — deterministic misses after alias matching
 - `empty_top_folders` — folder exists but has no contents
 - `matched_aliases` — where an alias was used (e.g. "Insurance Documents" matched "Insurance Docs")
 - `tree` — the actual folder + file structure (2-3 levels deep). Use this to reason beyond the template.
 - `days_since_drive_modified` — staleness signal
+- `issues` may include `drive_folder_outside_jobs_root` (folder name matches but lives somewhere outside Skylark Jobs — usually means a duplicate/orphan folder)
+
+When linking to the Drive folder for Tyler, render it as a Slack link: `<DRIVE_URL|Drive folder>`.
 
 REAL-WORLD RULE: The template is a guide, not a contract. Before flagging something missing, look at `tree` and ask "is there functional evidence this requirement is met?" Examples:
 - Template wants `Signed Contracts/` but `tree` shows `Contract Revisions/` contains `Contract SEC Video System.pdf` and a `Signed Documents/` subfolder — that IS the signed contract on file. Don't flag.
@@ -1001,7 +1096,7 @@ def analyze_with_claude(anthropic_client, data_bundle):
 
 Today is {data_bundle['as_of'][:10]}.
 
-The data below includes EVERY active SKY project with ALL todos (all_todos), ALL messages and comments (messages_and_comments), ALL cards (cards), schedule entries, and labor todos. Use all of it.
+The data below includes EVERY active SKY project with ALL todos (all_todos), ALL messages and comments (messages_and_comments), ALL cards (cards), schedule entries, labor todos, AND `drive_compliance` (Google Drive job folder audit per project). Use all of it. Drive is a primary data source — not optional context.
 
 Review all active project data below and produce a clear morning briefing in Slack markdown.
 
@@ -1009,6 +1104,7 @@ Format:
 - Start with a one-line summary count (e.g. "12 active jobs — 3 need attention")
 - List jobs needing action first (with specific issue)
 - Then jobs that are all-clear (just name + current phase)
+- After the per-project list, include a *Drive Health* section: any project with missing top-level folders, empty required folders, no Drive folder found, or `drive_folder_outside_jobs_root`. Use the `tree` to avoid false positives (alias matches, signed contracts in Contract Revisions/Signed Documents, etc.). Render the Drive folder as `<DRIVE_URL|Drive>` so Tyler can click through.
 - End with a "This Week" section: key milestones due in the next 7 days across all jobs
 
 Use :red_circle: for high issues, :large_yellow_circle: for medium, :white_check_mark: for clear.
@@ -1048,7 +1144,8 @@ Cover:
 6. Card table status (if present — what's in each column, anything blocked or stale)
 7. Full message/comment thread review — tone, open questions, anything unresolved
 8. Any SOP violations or engineering milestone flags
-9. Overall health: GREEN / YELLOW / RED with one-line reason
+9. *Drive folder review* — use `drive_compliance` from the data bundle. Confirm the resolved `drive_path`, link the `drive_url` as `<DRIVE_URL|Drive folder>`, and call out missing/empty required folders, stale activity, or "Damaged Product"-style sub-folders that hint at incidents. Use the `tree` to spot real evidence (signed contracts, current drawings, vendor docs, photos). Cross-reference Drive activity against Basecamp phase — design-phase project missing onsite photos is normal; onsite-phase project missing them is a flag.
+10. Overall health: GREEN / YELLOW / RED with one-line reason
 
 Use Slack markdown. Be thorough — Tyler wants the full picture.
 
@@ -1066,6 +1163,41 @@ Render the project name in the report header as a clickable Slack link using its
             print(f"Anthropic error (deep_dive): {type(e).__name__}: {e}")
             raise
         return {"type": "deep_dive", "project": project_name, "text": response.content[0].text.strip()}
+
+    elif mode == "drive_audit":
+        prompt = f"""You are Rick Stamen, the PM agent for Skylark AV. Tyler is asking for a Google Drive audit across every active SKY project.
+
+{SKYLARK_SOP_CONTEXT}
+
+As of {data_bundle['as_of'][:10]}.
+
+The data below contains every active SKY project's `drive_compliance` entry. Each has the resolved `drive_path`, `drive_url`, missing folders, empty folders, days-since-modified, and a 3-level `tree` of actual contents.
+
+Produce a Slack-formatted report focused ENTIRELY on Drive health. Do NOT discuss Basecamp todos, messages, or schedule — this is Drive-only.
+
+Format:
+- One-line summary at top: "X jobs audited — Y need attention"
+- *Critical* section: any project with `no_drive_folder_found`, `drive_folder_outside_jobs_root`, or missing top-level folders that are needed for the project's phase
+- *Empty / Stale* section: required folders that are present but empty (and the project is past the phase that should have populated them), folders untouched for 30+ days on active projects
+- *Naming / Layout Issues* section: folders that don't follow `Skylark Jobs > Client > SKY-XXXX | Job Name`, or sub-folders the ranker had to filter (Install Share Folder, Damaged Product, etc.)
+- *All Clear* section: jobs whose Drive folder is healthy — just SKY-id + a short note
+
+Use :red_circle: for critical, :large_yellow_circle: for medium, :white_check_mark: for clear. Always render every project as a clickable link using `app_url` from `project_summaries`: `<APP_URL|SKY-XXXX>`. Always render the Drive folder as `<DRIVE_URL|Drive>` so Tyler can click through.
+
+Apply the REAL-WORLD RULE — use `tree` to avoid false positives. `Insurance Docs/` with a COI satisfies `Insurance Documents/`; a signed contract in `Contract Revisions/Signed Documents/` satisfies `Signed Contracts/`. Don't flag template-name mismatches when functional evidence is there. Cross-reference Basecamp phase from `project_summaries` — missing onsite photos on a design-phase project is normal.
+
+--- DATA ---
+{data_json}
+"""
+        try:
+            response = anthropic_client.messages.create(
+                model="claude-opus-4-7", max_tokens=8000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as e:
+            print(f"Anthropic error (drive_audit): {type(e).__name__}: {e}")
+            raise
+        return {"type": "drive_audit", "text": response.content[0].text.strip()}
 
     else:
         # Standard hourly/on-demand alert analysis
@@ -1244,6 +1376,33 @@ def run_briefing():
     return result.get("text", "No briefing generated.")
 
 
+def run_drive_audit():
+    """Drive-only audit across every active SKY project."""
+    load_env()
+    load_secrets_from_gcp()
+    if token_needs_refresh():
+        refresh_bc_token()
+
+    projects = bc_get_all("/projects.json") or []
+    sky = fetch_active_sky_projects(projects)
+    project_summaries = [{
+        "id": p["id"], "name": p["name"], "app_url": p.get("app_url"),
+        "is_design": "(Design Contract)" in p.get("name", ""),
+    } for p in sky]
+    drive_compliance = audit_drive_for_projects(sky)
+
+    bundle = {
+        "mode": "drive_audit",
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "project_summaries": project_summaries,
+        "drive_compliance": drive_compliance,
+    }
+    result = analyze_with_claude(
+        anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]), bundle
+    )
+    return result.get("text", "Drive audit produced no output.")
+
+
 def run_deep_dive(project_query):
     """Full status report on a specific project."""
     load_env()
@@ -1290,6 +1449,12 @@ def main():
         text = run_deep_dive(project_query)
         post_freeform_to_slack(slack_client, channel_id, text, f"Deep Dive: {project_query}")
         print("Deep dive posted.")
+
+    elif mode == "drive_audit":
+        print("Running drive audit across active SKY projects...")
+        text = run_drive_audit()
+        post_freeform_to_slack(slack_client, channel_id, text, "Drive Audit")
+        print("Drive audit posted.")
 
     else:
         print(f"Running analysis (on_demand={on_demand})...")
