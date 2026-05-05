@@ -28,6 +28,45 @@ GCP_REGION = "us-central1"
 JOB_NAME = "pm-agent"
 PM_WATCH_CHANNEL = os.environ.get("PM_WATCH_CHANNEL_ID", "C0AU5J6SKQS")
 _seen_event_ids = set()
+_bot_user_id = None
+_parent_mention_cache = {}  # thread_ts -> bool (does parent @-mention the bot)
+
+
+def _get_bot_user_id():
+    global _bot_user_id
+    if _bot_user_id is None:
+        try:
+            client = WebClient(token=os.environ["SLACK_TOKEN"])
+            _bot_user_id = client.auth_test()["user_id"]
+        except Exception as e:
+            print(f"bot user id lookup failed: {e}")
+            _bot_user_id = ""
+    return _bot_user_id
+
+
+def _parent_mentions_bot(channel_id, thread_ts):
+    """True if the parent message of this thread @-mentions the bot."""
+    if not thread_ts:
+        return False
+    cached = _parent_mention_cache.get(thread_ts)
+    if cached is not None:
+        return cached
+    bot_id = _get_bot_user_id()
+    if not bot_id:
+        return False
+    try:
+        client = WebClient(token=os.environ["SLACK_TOKEN"])
+        resp = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=1)
+        msgs = resp.get("messages", [])
+        parent_text = (msgs[0].get("text") or "") if msgs else ""
+        result = f"<@{bot_id}>" in parent_text
+    except Exception as e:
+        print(f"parent-mention lookup failed for thread_ts={thread_ts}: {e}")
+        result = False
+    _parent_mention_cache[thread_ts] = result
+    if len(_parent_mention_cache) > 1000:
+        _parent_mention_cache.clear()
+    return result
 
 
 def verify_slack_signature(req):
@@ -98,6 +137,9 @@ def parse_command(text):
     if text in ("BRIEFING", "MORNING", "SUMMARY", "REPORT"):
         return "briefing", None
 
+    if "DRIVE" in text and not re.search(r'SKY-?\d+', text):
+        return "drive_audit", None
+
     match = re.search(r'SKY-(\d+)', text)
     if not match:
         match = re.search(r'\b(\d{4,})\b', text)
@@ -129,6 +171,8 @@ def slack_command():
         ack = f":mag: Looking up *{project_query}*... full status report in ~60 seconds."
     elif mode == "briefing":
         ack = ":sunrise: Generating morning briefing... coming up in ~60 seconds."
+    elif mode == "drive_audit":
+        ack = ":file_folder: Auditing Google Drive across every active project... ~3 min."
     else:
         ack = f":mag: On it, {user_name}. Scanning Basecamp... results in ~60 seconds."
 
@@ -171,11 +215,17 @@ def slack_events():
     is_dm = event.get("channel_type") == "im"
     in_pm_watch = channel_id == PM_WATCH_CHANNEL
     is_mention = event.get("type") == "app_mention"
+    is_thread_reply = bool(thread_ts) and thread_ts != event_ts
+    parent_invoked_bot = (
+        is_thread_reply
+        and not (in_pm_watch or is_dm or is_mention)
+        and _parent_mentions_bot(channel_id, thread_ts)
+    )
 
-    if not (in_pm_watch or is_dm or is_mention):
+    if not (in_pm_watch or is_dm or is_mention or parent_invoked_bot):
         return jsonify({"ok": True})
 
-    print(f"chat event: type={event.get('type')} channel={channel_id} thread_ts={thread_ts} event_ts={event_ts} dm={is_dm} mention={is_mention}")
+    print(f"chat event: type={event.get('type')} channel={channel_id} thread_ts={thread_ts} event_ts={event_ts} dm={is_dm} mention={is_mention} parent_invoked={parent_invoked_bot}")
     from chat import spawn_chat
     spawn_chat(text, channel_id, thread_ts, event_ts)
     return jsonify({"ok": True})

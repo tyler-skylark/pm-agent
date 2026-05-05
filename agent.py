@@ -877,6 +877,16 @@ TBD is only acceptable for Design Contract projects (not Standard Projects).
 [PM-SCHED] [ENG-SCHED] [PROC-SCHED] [SHOP-SCHED] [LOG-SCHED] [ONS-SCHED] [COM-SCHED] [FUT-SCHED]
 CRITICAL: Any incomplete schedule-tagged todo WITHOUT a due_on date = missing_dates flag.
 
+### Date is the source of truth (CRITICAL — read carefully before reporting)
+The `due_on` and `starts_on` fields are the source of truth for whether a milestone is scheduled. Title text — including placeholders like `(Trip #)`, `(TBD)`, `(Trip ?)` — does NOT override the date fields.
+
+When a todo has a real `due_on` (a parseable ISO date), the milestone IS scheduled. Report it as scheduled, using the actual dates. If the title also contains a placeholder, raise that as a SEPARATE, smaller flag — never as a reason to say the milestone "isn't confirmed" or "has no date."
+
+Wrong: "No install date confirmed in Basecamp [ONS-SCHED] yet" (when due_on = 2026-06-21 is set, even if title says "Trip #").
+Right: "Install scheduled 6/8 – 6/21 [ONS-SCHED]. Trip number placeholder still in title (`Trip #`) — minor cleanup needed."
+
+The same applies to any tagged todo: if the date is real, the date is real. Flag the title hygiene separately, with proportional severity.
+
 ### Date Ranges on Todos (CRITICAL — read this carefully)
 Basecamp todos can have a date range, not just a single due date. Each todo has TWO date fields:
 - `starts_on` — the FIRST day of the range (null if no range)
@@ -943,18 +953,36 @@ Key terms:
 - Project Closed [PM-SCHED]: 90 days after open
 
 ### Labor Scheduling
-[LABOR] todos live in the **Labor Scheduling** todoset. Format: "Name | Role | Status [LABOR]".
-Description must have Flights, Hotel, Per-Diem, Car Rental filled in.
-Missing travel info on an upcoming trip = flag.
+[LABOR] todos live in the **Labor Scheduling** todoset. Canonical title format: `Name | Role | Status [LABOR]`. Canonical description fields: Flights, Hotel, Per-Diem, Car Rental.
 
 EVERY confirmed [ONS-SCHED] onsite trip MUST have corresponding [LABOR] todos documenting who is going onsite for that trip. This is non-negotiable — onsite work without documented labor = SOP violation.
 
-Rule: for each [ONS-SCHED] trip with a real due date, there must be at least one [LABOR] todo in the Labor Scheduling todoset that covers that trip's date range. Tie the labor to the trip by date proximity (the [LABOR] dates should overlap or align with the [ONS-SCHED] trip date).
+Rule: for each [ONS-SCHED] trip with a real due date, there must be at least one [LABOR] todo in the Labor Scheduling todoset that covers that trip's date range. Tie the labor to the trip by date proximity (the [LABOR] dates should overlap or align with the [ONS-SCHED] trip date). A todo counts as a [LABOR] todo if its title contains the literal string `[LABOR]` — even if the rest of the title doesn't match the canonical format.
 
-Flag if:
-- A confirmed [ONS-SCHED] trip has zero [LABOR] todos covering it
-- A [LABOR] todo is missing the Flights/Hotel/Per-Diem/Car Rental fields when the trip is within 14 days
-- A [LABOR] todo exists but has no due date or assignee
+CRITICAL — distinguish ABSENT vs INCOMPLETE labor (Rick's most common misreport):
+Never say "no [LABOR] todos exist" when one is actually present, even if it's incomplete. The three states are distinct flags with distinct severity, and you must pick the correct one:
+
+1. **ABSENT** (highest severity, SOP violation):
+   No [LABOR] todo with date overlap exists for this trip at all.
+   Wording: "No [LABOR] todo exists for the {date range} install trip — SOP violation."
+
+2. **PRESENT-BUT-INCOMPLETE** (flag, not violation):
+   A [LABOR] todo with date overlap exists but is missing required fields. Always lead with what IS there before naming what's missing. Specific sub-flags (use the exact wording that fits):
+   - "[LABOR] todo present (`{title}`) but no assignee set"
+   - "[LABOR] todo present (`{title}`) but description missing booking info (Flights/Hotel/Per-Diem/Car Rental). Trip is {N} days out — needs to be filled in."
+   - "[LABOR] todo present (`{title}`) but title doesn't follow `Name | Role | Status [LABOR]` format — minor cleanup."
+   - "[LABOR] todo present (`{title}`) but missing due_on or starts_on date."
+
+3. **COMPLETE**: assignee + booking info filled in + dates set. No flag.
+
+Reporting wording — never use these phrases when a [LABOR] todo is actually present:
+- ❌ "no labor exists"
+- ❌ "no [LABOR] todos for this trip"
+- ❌ "labor not documented"
+
+Use those phrases ONLY for state #1 (truly absent).
+
+Triage thresholds for booking info: missing booking info is a flag whenever the trip is within 14 days. Outside 14 days it's a low-priority cleanup note.
 
 ### Required Client-Visible Todo Lists (Standard Projects only)
 These three todo lists MUST be set to "The client sees this" on every Standard Project:
