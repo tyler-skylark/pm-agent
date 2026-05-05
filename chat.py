@@ -27,6 +27,8 @@ from agent import (
     fetch_todos_for_project,
     get_dock_tool,
     get_drive_service,
+    refresh_bc_token,
+    token_needs_refresh,
 )
 
 CHAT_MODEL = "claude-sonnet-4-6"
@@ -478,6 +480,11 @@ def _chat_loop(slack, channel_id, thread_ts, messages):
 def handle_chat_message(text, channel_id, thread_ts, event_ts):
     """Run in a background thread — posts response directly to Slack."""
     try:
+        if token_needs_refresh():
+            try:
+                refresh_bc_token()
+            except Exception as e:
+                print(f"BC token refresh failed: {type(e).__name__}: {e}")
         slack = WebClient(token=os.environ["SLACK_TOKEN"])
         reply_thread = thread_ts or event_ts
         messages = _build_message_history(slack, channel_id, thread_ts, text)
