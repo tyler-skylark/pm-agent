@@ -227,10 +227,9 @@ def fetch_todos_for_project(proj):
     if not todolists:
         return [], [], [], []
 
-    # Check which lists are client-visible
-    client_recordings = bc_get_all(f"/buckets/{proj_id}/client/recordings.json")
-    client_visible_ids = {r.get("id") for r in (client_recordings or [])}
-
+    # Each todolist carries its own `visible_to_clients` flag — that's the
+    # source of truth. (We previously hit /buckets/{id}/client/recordings.json
+    # which 404s, causing every required list to false-flag as not-visible.)
     existing_list_names = {tlist.get("name", "") for tlist in todolists}
     client_visibility_issues = []
     for required_name in REQUIRED_CLIENT_VISIBLE_LISTS:
@@ -242,7 +241,7 @@ def fetch_todos_for_project(proj):
             })
         else:
             tlist_obj = next((t for t in todolists if t.get("name") == required_name), None)
-            if tlist_obj and tlist_obj.get("id") not in client_visible_ids:
+            if tlist_obj and not tlist_obj.get("visible_to_clients"):
                 client_visibility_issues.append({
                     "project": proj_name,
                     "list": required_name,
