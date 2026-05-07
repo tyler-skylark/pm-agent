@@ -330,13 +330,16 @@ def fetch_todos_for_project(proj):
                 "comments_count": todo.get("comments_count", 0),
                 "assignees": assignees,
                 "app_url": todo.get("app_url"),
-                "description": raw_desc[:600],
+                "description": raw_desc[:300],
             }
             all_todos.append(entry)
             if any(tag in title for tag in SCHED_TAGS):
                 schedule_todos.append(entry)
             if "[LABOR]" in title:
-                labor_todos.append(entry)
+                # Labor todos keep their full description so booking info
+                # (Flights/Hotel/Per-Diem/Car Rental) survives truncation.
+                labor_entry = {**entry, "description": raw_desc[:1200]}
+                labor_todos.append(labor_entry)
 
     return schedule_todos, labor_todos, all_todos, client_visibility_issues, fetch_incomplete
 
@@ -356,7 +359,7 @@ def fetch_messages_for_project(proj):
         board_title = board_tool.get("title", "")
         messages = bc_get_all(f"/buckets/{proj_id}/message_boards/{board_id}/messages.json")
         for msg in (messages or []):
-            content = _re.sub(r'<[^>]+>', ' ', (msg.get("content") or "")).strip()[:1500]
+            content = _re.sub(r'<[^>]+>', ' ', (msg.get("content") or "")).strip()[:600]
             entry = {
                 "project": proj_name,
                 "type": "message",
@@ -372,7 +375,7 @@ def fetch_messages_for_project(proj):
             msg_id = msg.get("id")
             comments = bc_get_all(f"/buckets/{proj_id}/recordings/{msg_id}/comments.json")
             for comment in (comments or []):
-                c_content = _re.sub(r'<[^>]+>', ' ', (comment.get("content") or "")).strip()[:800]
+                c_content = _re.sub(r'<[^>]+>', ' ', (comment.get("content") or "")).strip()[:400]
                 result.append({
                     "project": proj_name,
                     "type": "comment",
@@ -397,7 +400,7 @@ def fetch_inbox_forwards_for_project(proj):
     forwards = bc_get_all(f"/buckets/{proj_id}/inbox_forwards.json")
     result = []
     for fwd in (forwards or []):
-        content = _re.sub(r'<[^>]+>', ' ', (fwd.get("content") or "")).strip()[:1500]
+        content = _re.sub(r'<[^>]+>', ' ', (fwd.get("content") or "")).strip()[:600]
         entry = {
             "project": proj_name,
             "type": "email_forward",
@@ -413,7 +416,7 @@ def fetch_inbox_forwards_for_project(proj):
         fwd_id = fwd.get("id")
         comments = bc_get_all(f"/buckets/{proj_id}/recordings/{fwd_id}/comments.json")
         for comment in (comments or []):
-            c_content = _re.sub(r'<[^>]+>', ' ', (comment.get("content") or "")).strip()[:800]
+            c_content = _re.sub(r'<[^>]+>', ' ', (comment.get("content") or "")).strip()[:400]
             result.append({
                 "project": proj_name,
                 "type": "email_forward_comment",
@@ -863,19 +866,24 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
 
     drive_compliance = audit_drive_for_projects(projects_to_fetch)
 
+    # IMPORTANT: field order matters. The data bundle gets serialized to JSON
+    # and may be truncated at ~800k chars before the LLM sees it. Small,
+    # high-signal "anchor" fields go FIRST so they always survive truncation.
+    # Bulk content (all_todos, messages_and_comments) goes LAST so it's the
+    # first thing dropped when the bundle gets too big.
     return {
         "mode": mode,
+        "as_of": datetime.now(timezone.utc).isoformat(),
         "project_summaries": project_summaries,
-        "schedule_tagged_todos": all_schedule_todos,
-        "labor_todos": all_labor_todos,
-        "all_todos": all_todos,
-        "messages_and_comments": all_messages,
-        "cards": all_cards,
-        "client_visibility_issues": all_client_visibility_issues,
         "incomplete_fetches": incomplete_fetches,
+        "client_visibility_issues": all_client_visibility_issues,
+        "labor_todos": all_labor_todos,
+        "schedule_tagged_todos": all_schedule_todos,
         "upcoming_schedule_entries": schedule_entries,
         "drive_compliance": drive_compliance,
-        "as_of": datetime.now(timezone.utc).isoformat(),
+        "cards": all_cards,
+        "all_todos": all_todos,
+        "messages_and_comments": all_messages,
     }
 
 
@@ -1147,7 +1155,9 @@ These rules override anything else in this prompt. Before flagging an issue, the
 def analyze_with_claude(anthropic_client, data_bundle):
     mode = data_bundle.get("mode", "briefing")
     full_data_json = json.dumps(data_bundle, indent=2)
-    DATA_LIMIT = 500000
+    # ~800k chars is roughly 200k tokens — comfortably inside Opus 4.7's 1M
+    # context but leaves room for the prompt itself and the response budget.
+    DATA_LIMIT = 800000
     truncated = len(full_data_json) > DATA_LIMIT
     data_json = full_data_json[:DATA_LIMIT]
     if truncated:
