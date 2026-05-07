@@ -68,7 +68,7 @@ Voice & personality:
 - ALWAYS render project references as clickable Slack links using the project's `app_url`. Format: `<APP_URL|SKY-XXXX>` (Slack link syntax — angle brackets, URL, pipe, display text). Example: `<https://3.basecamp.com/4358663/projects/41746046|SKY-2224>`. Never write a bare `SKY-XXXX` or `` `SKY-XXXX` `` when you have the app_url available — make it clickable so Tyler can jump straight to the project. This applies to every mention: bullet lists, inline references, headers, everything. If you don't have the app_url for a project, fetch `list_active_projects` or `get_project_details` to get it.
 - Lead with the conclusion, then the supporting detail. Under 300 words unless Tyler asks for a full report.
 - Don't narrate quick lookups. If Tyler asks "how is SKY-2446 doing?", just answer — don't say "let me check" first. Most tool calls return in a few seconds; nobody needs a heads-up for them.
-- DO drop a one-line heads-up before triggering anything that posts a separate message later or genuinely takes a while. Specifically: `trigger_briefing` (~5 min), `trigger_deep_dive` (~5 min), `trigger_drive_audit`, `trigger_issue_scan`. One line in your own voice — "Kicking off the briefing, posting separately in a few." — not a canned phrase.
+- DO drop a one-line heads-up before triggering anything that posts a separate message later or genuinely takes a while. Specifically: `trigger_briefing` (~5 min), `trigger_deep_dive` (~5 min), `trigger_drive_audit` (~3 min). One line in your own voice — "Kicking off the briefing, posting separately in a few." — not a canned phrase.
 - If the data is incomplete or broken, say that plainly instead of guessing.
 
 Conversation continuity:
@@ -92,7 +92,7 @@ def _build_system_prompt():
 
 CURRENT DATE/TIME: {_now_cst_string()} (Skylark HQ is on Central Time). Use this for ALL date math — "tomorrow", "next week", "overdue", "X days from now". Don't guess; the timestamp above is authoritative for this turn.
 
-You have read-only access to Basecamp projects and the Skylark Google Drive job folders. You can also trigger background jobs (briefing, analysis, deep dive, drive audit) which post their output as separate messages.
+You have read-only access to Basecamp projects and the Skylark Google Drive job folders. You can also trigger background jobs (briefing, deep dive, drive audit) which post their output as separate messages.
 
 When a user asks for "a briefing" or "full status," call `trigger_briefing`. When they ask about a specific SKY project ("how is SKY-2446 doing?"), either answer directly from `get_project_details` for a quick read, or call `trigger_deep_dive` for a full written report (takes ~5 min, posts separately). When they ask "do a drive audit", "check the drive", "are all the drive folders set up" or similar cross-project Drive questions, call `trigger_drive_audit`.
 
@@ -105,7 +105,6 @@ When Tyler asks what you can do, what you help with, what your capabilities are,
 > • *Drive audit* — sweep every project's Google Drive folder for missing/empty/misnamed folders. Ask "drive audit" or "check the drive".
 > • *Drive lookup* on one project — show me which Drive folder a SKY-id resolves to, plus all candidates. Ask "where is the Drive folder for SKY-2429".
 > • *Find a todo* — search across all projects by keyword, optionally filter by assignee or project. Ask "any todos about L-Acoustics?" or "show me Sarah's overdue items".
-> • *Issue scan* — flag new SOP/schedule/communication issues since the last hourly run. Ask "scan for issues" or "what's broken right now".
 >
 > Everything is read-only — I don't write to Basecamp.
 
@@ -181,11 +180,6 @@ CHAT_TOOLS = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
-        "name": "trigger_analysis",
-        "description": "Kick off an hourly-style analysis job — flags new issues since last run. Posts separately when complete.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
         "name": "trigger_deep_dive",
         "description": "Kick off a full written deep-dive report on ONE project. Posts separately when complete (~5 min).",
         "input_schema": {
@@ -245,7 +239,7 @@ def tool_get_project_details(sky_id_or_name):
     if not proj:
         return {"error": f"No project found matching '{sky_id_or_name}'"}
 
-    sched, labor, todos, client_vis = fetch_todos_for_project(proj)
+    sched, labor, todos, client_vis, fetch_incomplete = fetch_todos_for_project(proj)
     messages = fetch_messages_for_project(proj)
     emails = fetch_inbox_forwards_for_project(proj)
     cards = fetch_cards_for_project(proj)
@@ -276,6 +270,7 @@ def tool_get_project_details(sky_id_or_name):
         "messages_and_comments": messages + emails,
         "cards": cards,
         "client_visibility_issues": client_vis,
+        "fetch_incomplete": fetch_incomplete,
     }
 
 
@@ -291,7 +286,7 @@ def tool_search_todos(query, project=None, assignee=None):
     assignee_lower = (assignee or "").lower()
     hits = []
     for proj in sky:
-        _, _, todos, _ = fetch_todos_for_project(proj)
+        _, _, todos, _, _ = fetch_todos_for_project(proj)
         for t in todos:
             blob = (t.get("title", "") + " " + (t.get("description") or "")).lower()
             if query_lower not in blob:
@@ -346,11 +341,6 @@ def tool_trigger_briefing():
     return {"ok": True, "message": "Briefing job triggered — will post separately in ~5 min."}
 
 
-def tool_trigger_analysis():
-    _trigger_job_external("analysis")
-    return {"ok": True, "message": "Analysis job triggered — will post separately in ~5 min."}
-
-
 def tool_trigger_deep_dive(sky_id):
     m = re.match(r'SKY-?(\d+)', sky_id.upper())
     if not m:
@@ -379,7 +369,6 @@ TOOL_DISPATCH = {
     "get_drive_compliance": lambda sky_id, **_: tool_get_drive_compliance(sky_id),
     "find_drive_folder": lambda sky_id, **_: tool_find_drive_folder(sky_id),
     "trigger_briefing": lambda **_: tool_trigger_briefing(),
-    "trigger_analysis": lambda **_: tool_trigger_analysis(),
     "trigger_deep_dive": lambda sky_id, **_: tool_trigger_deep_dive(sky_id),
     "trigger_drive_audit": lambda **_: tool_trigger_drive_audit(),
 }

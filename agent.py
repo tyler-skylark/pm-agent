@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 Skylark Rick Stamen PM Agent
-Features: hourly alerts, morning briefing, deep dive, deduplication, stale detection
+Modes: morning briefing, deep dive, drive audit
 """
 
-import hashlib
 import json
 import os
+import socket
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +21,6 @@ TODOLIST_FETCH_WORKERS = 4
 
 import anthropic
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 
 ACCOUNT_ID = "4358663"
 BC_BASE = f"https://3.basecampapi.com/{ACCOUNT_ID}"
@@ -28,7 +28,6 @@ TOKEN_ENDPOINT = "https://launchpad.37signals.com/authorization/token"
 USER_AGENT = "Skylark PM Agent (tyler@skylarkav.com)"
 
 SCRIPT_DIR = Path(__file__).parent
-STATE_FILE = SCRIPT_DIR / "state.json"
 ENV_FILE = SCRIPT_DIR / ".env"
 
 SCHED_TAGS = ["[PM-SCHED]", "[ENG-SCHED]", "[PROC-SCHED]", "[SHOP-SCHED]",
@@ -65,18 +64,6 @@ def load_secrets_from_gcp():
             os.environ[name] = resp.payload.data.decode("utf-8")
         except Exception:
             pass
-
-
-# ── State ──────────────────────────────────────────────────────────────────────
-
-def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"last_run": None, "seen_alerts": {}}
-
-
-def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
 # ── Token refresh ──────────────────────────────────────────────────────────────
@@ -121,26 +108,57 @@ def refresh_bc_token():
 
 # ── Basecamp API ───────────────────────────────────────────────────────────────
 
-def bc_get(path, params=None, retries=2):
-    url = path if path.startswith("http") else f"{BC_BASE}{path}"
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    for attempt in range(retries + 1):
+# 4xx (other than 429) means "the request itself is bad" — won't get better with
+# retries. Anything in this set is a transient infrastructure failure and IS
+# safe to retry. Critically: silent return on a transient error was masking
+# fetch failures in parallel todoset reads, producing phantom "list missing"
+# false-positive flags in briefings.
+_BC_RETRY_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _bc_request_raw(url, max_attempts=5):
+    """Single GET with retry on transient errors. Returns (json_data, link_header).
+
+    Returns (None, "") only after exhausting retries on a transient error, or
+    immediately on a hard 4xx (auth, not found, malformed). Logs the failure
+    so callers (and Cloud Logging) can see it instead of having it silently
+    swallowed.
+    """
+    backoff = 1.0
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
         req = urllib.request.Request(url, headers={
             "Authorization": f"Bearer {os.environ['BC_ACCESS_TOKEN']}",
             "User-Agent": USER_AGENT,
         })
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 return json.loads(resp.read()), resp.headers.get("Link", "")
         except urllib.error.HTTPError as e:
-            if e.code == 429:
-                time.sleep(2 ** attempt)
+            last_err = f"HTTP {e.code}"
+            if e.code in _BC_RETRY_STATUSES and attempt < max_attempts:
+                time.sleep(backoff)
+                backoff *= 2
                 continue
+            print(f"bc fetch FAILED ({last_err}, attempt {attempt}/{max_attempts}): {url}")
             return None, ""
-        except Exception:
+        except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
+            last_err = type(e).__name__
+            if attempt < max_attempts:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            print(f"bc fetch FAILED ({last_err}, attempt {attempt}/{max_attempts}): {url}")
             return None, ""
+    print(f"bc fetch EXHAUSTED ({last_err}): {url}")
     return None, ""
+
+
+def bc_get(path, params=None):
+    url = path if path.startswith("http") else f"{BC_BASE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    return _bc_request_raw(url)
 
 
 def bc_get_data(path, params=None):
@@ -150,7 +168,13 @@ def bc_get_data(path, params=None):
 
 
 def bc_get_all(path, params=None, max_pages=10):
-    """Fetch all pages of a paginated BC3 endpoint."""
+    """Fetch all pages of a paginated BC3 endpoint.
+
+    Returns a list, or whatever the endpoint returns if it's not a list. On
+    transient failure mid-pagination we surface the failure rather than
+    returning a half-populated list — partial data is the bug we're guarding
+    against.
+    """
     import re
     results = []
     url = (path if path.startswith("http") else f"{BC_BASE}{path}")
@@ -158,23 +182,19 @@ def bc_get_all(path, params=None, max_pages=10):
         url += "?" + urllib.parse.urlencode(params)
 
     for _ in range(max_pages):
-        req = urllib.request.Request(url, headers={
-            "Authorization": f"Bearer {os.environ['BC_ACCESS_TOKEN']}",
-            "User-Agent": USER_AGENT,
-        })
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-                link_header = resp.headers.get("Link", "")
-        except Exception:
-            break
+        data, link_header = _bc_request_raw(url)
+        if data is None:
+            # Transient failure even after retries. Returning [] would look
+            # identical to "endpoint legitimately empty" downstream and trigger
+            # phantom flags. Re-raise so the caller knows to skip this project
+            # rather than report incomplete data.
+            raise RuntimeError(f"bc_get_all could not complete fetch: {url}")
 
         if isinstance(data, list):
             results.extend(data)
         else:
             return data  # not a list, just return as-is
 
-        # Parse next page from Link header
         next_url = None
         for part in link_header.split(","):
             if 'rel="next"' in part:
@@ -207,61 +227,86 @@ REQUIRED_CLIENT_VISIBLE_LISTS = {"Onsite Phase", "Commissioning Phase", "Closeou
 
 
 def fetch_todos_for_project(proj):
+    """Returns (schedule_todos, labor_todos, all_todos, client_visibility_issues, fetch_incomplete).
+
+    `fetch_incomplete=True` means at least one todoset or todolist read failed
+    after all retries. When that's the case the caller should NOT report
+    "no labor", "list missing", or "all clear" for this project — the
+    underlying data is partial.
+    """
     import re as _re
     proj_id = proj["id"]
     proj_name = proj["name"]
+    fetch_incomplete = False
     todoset_tools = [d for d in proj.get("dock", [])
                      if d.get("name") == "todoset" and d.get("enabled")]
     if not todoset_tools:
-        return [], [], [], []
+        return [], [], [], [], False
 
     def _fetch_todoset_lists(ts):
-        return ts, bc_get_all(f"/buckets/{proj_id}/todosets/{ts['id']}/todolists.json")
+        try:
+            return ts, bc_get_all(f"/buckets/{proj_id}/todosets/{ts['id']}/todolists.json"), False
+        except RuntimeError as e:
+            print(f"todoset fetch failed for project {proj_id} todoset {ts.get('id')}: {e}")
+            return ts, [], True
 
     todolists = []
     with ThreadPoolExecutor(max_workers=TODOLIST_FETCH_WORKERS) as pool:
-        for ts, tl in pool.map(_fetch_todoset_lists, todoset_tools):
+        for ts, tl, failed in pool.map(_fetch_todoset_lists, todoset_tools):
+            if failed:
+                fetch_incomplete = True
+                continue
             for t in (tl or []):
                 t["_todoset_title"] = ts.get("title", "")
             todolists.extend(tl or [])
     if not todolists:
-        return [], [], [], []
+        return [], [], [], [], fetch_incomplete
 
     # Each todolist carries its own `visible_to_clients` flag — that's the
     # source of truth. (We previously hit /buckets/{id}/client/recordings.json
     # which 404s, causing every required list to false-flag as not-visible.)
+    # If fetch_incomplete is already True, skip the visibility check — we
+    # might be missing the very todoset that holds the required list.
     existing_list_names = {tlist.get("name", "") for tlist in todolists}
     client_visibility_issues = []
-    for required_name in REQUIRED_CLIENT_VISIBLE_LISTS:
-        if required_name not in existing_list_names:
-            client_visibility_issues.append({
-                "project": proj_name,
-                "list": required_name,
-                "issue": "missing_list",
-            })
-        else:
-            tlist_obj = next((t for t in todolists if t.get("name") == required_name), None)
-            if tlist_obj and not tlist_obj.get("visible_to_clients"):
+    if not fetch_incomplete:
+        for required_name in REQUIRED_CLIENT_VISIBLE_LISTS:
+            if required_name not in existing_list_names:
                 client_visibility_issues.append({
                     "project": proj_name,
                     "list": required_name,
-                    "issue": "not_client_visible",
-                    "app_url": tlist_obj.get("app_url"),
+                    "issue": "missing_list",
                 })
+            else:
+                tlist_obj = next((t for t in todolists if t.get("name") == required_name), None)
+                if tlist_obj and not tlist_obj.get("visible_to_clients"):
+                    client_visibility_issues.append({
+                        "project": proj_name,
+                        "list": required_name,
+                        "issue": "not_client_visible",
+                        "app_url": tlist_obj.get("app_url"),
+                    })
 
     def _fetch_list_todos(tlist):
         lid = tlist["id"]
-        open_t = bc_get_all(f"/buckets/{proj_id}/todolists/{lid}/todos.json",
-                            {"completed": "false"}) or []
-        done_t = bc_get_all(f"/buckets/{proj_id}/todolists/{lid}/todos.json",
-                            {"completed": "true"}) or []
-        return tlist, open_t, done_t
+        try:
+            open_t = bc_get_all(f"/buckets/{proj_id}/todolists/{lid}/todos.json",
+                                {"completed": "false"}) or []
+            done_t = bc_get_all(f"/buckets/{proj_id}/todolists/{lid}/todos.json",
+                                {"completed": "true"}) or []
+            return tlist, open_t, done_t, False
+        except RuntimeError as e:
+            print(f"todolist fetch failed for project {proj_id} list {lid}: {e}")
+            return tlist, [], [], True
 
     schedule_todos, labor_todos, all_todos = [], [], []
     with ThreadPoolExecutor(max_workers=TODOLIST_FETCH_WORKERS) as pool:
         list_results = list(pool.map(_fetch_list_todos, todolists))
 
-    for tlist, open_todos, done_todos in list_results:
+    for tlist, open_todos, done_todos, list_failed in list_results:
+        if list_failed:
+            fetch_incomplete = True
+            continue
         list_name = tlist.get("name", "")
         for todo in open_todos + done_todos:
             title = todo.get("content", "")
@@ -293,7 +338,7 @@ def fetch_todos_for_project(proj):
             if "[LABOR]" in title:
                 labor_todos.append(entry)
 
-    return schedule_todos, labor_todos, all_todos, client_visibility_issues
+    return schedule_todos, labor_todos, all_todos, client_visibility_issues, fetch_incomplete
 
 
 def fetch_messages_for_project(proj):
@@ -710,15 +755,9 @@ def audit_drive_for_projects(sky_projects):
     return out
 
 
-def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
+def fetch_basecamp_data(mode="briefing", project_query=None):
     print(f"Fetching Basecamp data (mode={mode})...")
 
-    events_params = {"page": 1}
-    if last_run and mode == "analysis":
-        events_params["since"] = last_run
-    recent_events = bc_get_data("/events.json", events_params) or []
-
-    notifications = bc_get_data("/notifications.json") if mode == "analysis" else []
     projects = bc_get_all("/projects.json") or []
     sky_projects = fetch_active_sky_projects(projects)
 
@@ -731,23 +770,6 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
             return {"error": f"No project found matching {project_query}"}
         sky_projects = matched
 
-    # Stale detection: projects with no events in the feed
-    active_project_ids_in_events = set()
-    for event in recent_events:
-        bucket = event.get("bucket") or {}
-        if bucket.get("id"):
-            active_project_ids_in_events.add(bucket["id"])
-
-    stale_projects = []
-    for proj in sky_projects:
-        if "(Design Contract)" in proj["name"]:
-            continue
-        if proj["id"] not in active_project_ids_in_events:
-            stale_projects.append({
-                "project": proj["name"],
-                "description": proj.get("description", "")[:200],
-            })
-
     # Per-project data
     all_schedule_todos, all_labor_todos, all_todos = [], [], []
     all_messages, all_cards, all_client_visibility_issues = [], [], []
@@ -755,19 +777,43 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
     projects_to_fetch = sky_projects[:1] if mode == "deep_dive" else sky_projects
 
     def _fetch_project_bundle(proj):
-        sched_t, labor_t, proj_t, vis = fetch_todos_for_project(proj)
-        msgs = fetch_messages_for_project(proj)
-        emails = fetch_inbox_forwards_for_project(proj)
-        cards_p = fetch_cards_for_project(proj)
+        try:
+            sched_t, labor_t, proj_t, vis, todos_incomplete = fetch_todos_for_project(proj)
+        except Exception as e:
+            print(f"_fetch_project_bundle todos failed for {proj['id']}: {type(e).__name__}: {e}")
+            sched_t, labor_t, proj_t, vis, todos_incomplete = [], [], [], [], True
+
+        try:
+            msgs = fetch_messages_for_project(proj)
+        except Exception as e:
+            print(f"_fetch_project_bundle messages failed for {proj['id']}: {type(e).__name__}: {e}")
+            msgs = []
+
+        try:
+            emails = fetch_inbox_forwards_for_project(proj)
+        except Exception as e:
+            print(f"_fetch_project_bundle inbox failed for {proj['id']}: {type(e).__name__}: {e}")
+            emails = []
+
+        try:
+            cards_p = fetch_cards_for_project(proj)
+        except Exception as e:
+            print(f"_fetch_project_bundle cards failed for {proj['id']}: {type(e).__name__}: {e}")
+            cards_p = []
+
         sched_entries = []
         sched_tool = get_dock_tool(proj, "schedule")
         if sched_tool:
-            sched_entries = bc_get_all(
-                f"/buckets/{proj['id']}/schedules/{sched_tool['id']}/entries.json"
-            ) or []
+            try:
+                sched_entries = bc_get_all(
+                    f"/buckets/{proj['id']}/schedules/{sched_tool['id']}/entries.json"
+                ) or []
+            except RuntimeError as e:
+                print(f"_fetch_project_bundle schedule entries failed for {proj['id']}: {e}")
+                sched_entries = []
             for e in sched_entries:
                 e["_project_name"] = proj["name"]
-        return proj, sched_t, labor_t, proj_t, vis, msgs, emails, cards_p, sched_entries
+        return proj, sched_t, labor_t, proj_t, vis, msgs, emails, cards_p, sched_entries, todos_incomplete
 
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=PROJECT_FETCH_WORKERS) as pool:
@@ -775,12 +821,13 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
     print(f"Fetched {len(bundles)} projects in {(time.perf_counter() - t0):.1f}s")
 
     schedule_entries = []
+    incomplete_fetches = []
     cutoff_msg = cutoff_done = None
-    if mode in ("briefing", "analysis"):
+    if mode == "briefing":
         cutoff_msg = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         cutoff_done = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
 
-    for proj, sched_todos, labor_todos, proj_todos, client_vis_issues, messages, email_forwards, cards, sched_entries in bundles:
+    for proj, sched_todos, labor_todos, proj_todos, client_vis_issues, messages, email_forwards, cards, sched_entries, fetch_incomplete in bundles:
         desc = proj.get("description", "")
         is_design_contract = "(Design Contract)" in proj.get("name", "")
         project_summaries.append({
@@ -789,7 +836,13 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
             "description": desc[:500],
             "type": "Design Contract" if is_design_contract else "Standard Project",
             "app_url": proj.get("app_url"),
+            "fetch_incomplete": fetch_incomplete,
         })
+        if fetch_incomplete:
+            incomplete_fetches.append({
+                "project": proj["name"],
+                "app_url": proj.get("app_url"),
+            })
 
         if cutoff_msg:
             messages = [m for m in messages if m.get("created_at", "") >= cutoff_msg]
@@ -812,8 +865,6 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
 
     return {
         "mode": mode,
-        "recent_events": recent_events[:100] if mode == "analysis" else [],
-        "notifications": (notifications or [])[:50],
         "project_summaries": project_summaries,
         "schedule_tagged_todos": all_schedule_todos,
         "labor_todos": all_labor_todos,
@@ -821,35 +872,11 @@ def fetch_basecamp_data(last_run=None, mode="analysis", project_query=None):
         "messages_and_comments": all_messages,
         "cards": all_cards,
         "client_visibility_issues": all_client_visibility_issues,
-        "stale_projects": stale_projects,
+        "incomplete_fetches": incomplete_fetches,
         "upcoming_schedule_entries": schedule_entries,
         "drive_compliance": drive_compliance,
-        "last_run": last_run,
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
-
-
-# ── Alert deduplication ────────────────────────────────────────────────────────
-
-def alert_fingerprint(alert):
-    key = f"{alert.get('project','')}-{alert.get('category','')}-{alert.get('description','')[:60]}"
-    return hashlib.md5(key.encode()).hexdigest()
-
-
-def deduplicate_alerts(alerts, state):
-    seen = state.get("seen_alerts", {})
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    seen = {k: v for k, v in seen.items() if v > cutoff}
-
-    new_alerts = []
-    for alert in alerts:
-        fp = alert_fingerprint(alert)
-        if fp not in seen:
-            new_alerts.append(alert)
-            seen[fp] = datetime.now(timezone.utc).isoformat()
-
-    state["seen_alerts"] = seen
-    return new_alerts, state
 
 
 # ── SOP context ────────────────────────────────────────────────────────────────
@@ -1101,12 +1128,24 @@ Cross-reference against Basecamp phase. Missing a signed contract on a design-ph
 """
 
 
-# ── Claude analysis ────────────────────────────────────────────────────────────
+# ── Claude prompts ────────────────────────────────────────────────────────────
+
+REPORTING_DISCIPLINE = """### Reporting discipline (read before flagging anything)
+
+These rules override anything else in this prompt. Before flagging an issue, the data must literally show it. Do not infer the absence of something from the absence of context — silence is not evidence.
+
+1. **Client visibility — only flag if the array shows it.** A required list is "not client visible" if and only if `client_visibility_issues` contains an entry for that project + list. Empty array for a project = no flag, period. Do not infer client visibility from the project's phase, type, or any other signal. If you say "client can't see Onsite Phase," cite the matching `client_visibility_issues` entry.
+
+2. **Schedule presence lives in TWO places.** A project HAS a schedule if either `schedule_tagged_todos` OR `upcoming_schedule_entries` contains an entry for it. Before saying "no install date" or "no schedule," check BOTH. An [ONS-SCHED] todo with a real `due_on` (or `starts_on`) IS a confirmed install date even if the title contains placeholders like `(Trip #)`.
+
+3. **Read message threads as conversations.** Items in `messages_and_comments` with the same `parent_title` belong to the same thread — original message + replies. A reply that answers the question = resolved. Do NOT flag as "unanswered" if a later comment provides the answer. When summarizing a project's communication state, pair every flagged "open question" with what would resolve it; if a reply already does, drop the flag.
+
+4. **Incomplete fetches are not "all clear."** If a project's `project_summaries` entry has `fetch_incomplete: true`, the underlying data is partial. Do NOT analyze its content as if it were complete. Surface it in a separate "Data fetch incomplete" line so Tyler knows to retry, but never report "no labor" / "no schedule" / "all clear" on a project with `fetch_incomplete: true`.
+"""
+
 
 def analyze_with_claude(anthropic_client, data_bundle):
-    mode = data_bundle.get("mode", "analysis")
-    last_run = data_bundle.get("last_run")
-    since_str = last_run or "the past hour"
+    mode = data_bundle.get("mode", "briefing")
     full_data_json = json.dumps(data_bundle, indent=2)
     DATA_LIMIT = 500000
     truncated = len(full_data_json) > DATA_LIMIT
@@ -1121,9 +1160,11 @@ def analyze_with_claude(anthropic_client, data_bundle):
 
 {SKYLARK_SOP_CONTEXT}
 
+{REPORTING_DISCIPLINE}
+
 Today is {data_bundle['as_of'][:10]}.
 
-The data below includes EVERY active SKY project with ALL todos (all_todos), ALL messages and comments (messages_and_comments), ALL cards (cards), schedule entries, labor todos, AND `drive_compliance` (Google Drive job folder audit per project). Use all of it. Drive is a primary data source — not optional context.
+The data below includes EVERY active SKY project with ALL todos (all_todos), ALL messages and comments (messages_and_comments), ALL cards (cards), `upcoming_schedule_entries` (Basecamp Schedule dock — events/calendar entries), labor todos, AND `drive_compliance` (Google Drive job folder audit per project). Use all of it. Drive is a primary data source — not optional context.
 
 Review all active project data below and produce a clear morning briefing in Slack markdown.
 
@@ -1131,6 +1172,7 @@ Format:
 - Start with a one-line summary count (e.g. "12 active jobs — 3 need attention")
 - List jobs needing action first (with specific issue)
 - Then jobs that are all-clear (just name + current phase)
+- If `incomplete_fetches` has any entries, list them in a small "Data fetch incomplete" section so Tyler knows to re-run — do not analyze those projects' content
 - After the per-project list, include a *Drive Health* section: any project with missing top-level folders, empty required folders, no Drive folder found, or `drive_folder_outside_jobs_root`. Use the `tree` to avoid false positives (alias matches, signed contracts in Contract Revisions/Signed Documents, etc.). Render the Drive folder as `<DRIVE_URL|Drive>` so Tyler can click through.
 - End with a "This Week" section: key milestones due in the next 7 days across all jobs
 
@@ -1157,6 +1199,8 @@ ALWAYS render every project name as a clickable Slack link using the project's `
         prompt = f"""You are Rick Stamen, the PM agent for Skylark AV. Give Tyler a full status report on {project_name}.
 
 {SKYLARK_SOP_CONTEXT}
+
+{REPORTING_DISCIPLINE}
 
 As of {data_bundle['as_of'][:10]}.
 
@@ -1226,98 +1270,10 @@ Apply the REAL-WORLD RULE — use `tree` to avoid false positives. `Insurance Do
             raise
         return {"type": "drive_audit", "text": response.content[0].text.strip()}
 
-    else:
-        # Standard hourly/on-demand alert analysis
-        prompt = f"""You are Rick Stamen, the PM agent for Skylark AV. Review Basecamp data and flag issues needing Tyler's attention.
-
-{SKYLARK_SOP_CONTEXT}
-
-The data below includes ALL todos (all_todos), ALL messages and comments (messages_and_comments), ALL cards (cards), schedule entries, and labor todos across every active SKY project. Read all of it carefully.
-
-Flag these issues:
-1. **Upset / Frustrated** — tense tone in messages or comments (read the actual content)
-2. **Missing Dates** — incomplete [XXXX-SCHED] todo with no due_on date (breaks phase logic)
-3. **SOP Deviation** — wrong board, TBD fields on active jobs, [LABOR] missing travel info, no GO/NO-GO before install
-4. **Schedule Risk** — milestones overdue relative to onsite dates, install <14 days with no GO/NO-GO
-5. **Communication Gap** — client or team question unanswered for 24+ hours
-6. **Stale Project** — active-phase project with zero recent Basecamp activity
-7. **Closeout Overdue** — Client First Open passed >90 days ago, project not closed
-8. **Blocked / Stuck** — todo or card sitting in the same state with no activity, assignee missing, or description says waiting on something
-9. **Engineering Milestone Violation** — per the two-track milestone system, flag if wrong deliverable at wrong stage
-10. **Client Visibility** — any entry in `client_visibility_issues` means a required list (Onsite Phase, Commissioning Phase, or Closeout Phase) is either missing or not set to client-visible
-
-Only flag real issues. Skip Design Contract projects for TBD field violations — those are pre-execution. Standard Projects must have all fields filled.
-
-Return ONLY a JSON array:
-[{{
-  "category": "Upset Team Member | Missing Dates | SOP Deviation | Schedule Risk | Communication Gap | Stale Project | Closeout Overdue | Client Visibility",
-  "severity": "high | medium | low",
-  "description": "1-2 sentences. Name the project, todo, person, and timing.",
-  "url": "basecamp app_url for the specific todo/message/card, or null",
-  "project": "SKY-XXXX project name or null",
-  "project_url": "the project's app_url from project_summaries, or null"
-}}]
-
-If nothing needs attention, return [].
-
---- DATA ---
-{data_json}
-"""
-        try:
-            response = anthropic_client.messages.create(
-                model="claude-opus-4-7", max_tokens=4000,
-                messages=[{"role": "user", "content": prompt}],
-            )
-        except Exception as e:
-            print(f"Anthropic error (analysis): {type(e).__name__}: {e}")
-            raise
-        text = response.content[0].text.strip()
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-        try:
-            return {"type": "alerts", "alerts": json.loads(text)}
-        except json.JSONDecodeError:
-            print(f"Could not parse Claude response:\n{text}")
-            return {"type": "alerts", "alerts": []}
+    raise ValueError(f"Unknown analyze_with_claude mode: {mode!r}")
 
 
 # ── Slack posting ──────────────────────────────────────────────────────────────
-
-SEVERITY_EMOJI = {"high": ":red_circle:", "medium": ":large_yellow_circle:", "low": ":large_blue_circle:"}
-
-
-def post_alerts_to_slack(slack_client, channel_id, alerts, title=None):
-    now = datetime.now().strftime("%b %d, %I:%M %p")
-    header = title or f"Rick Stamen  —  {now}"
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": header}},
-        {"type": "divider"},
-    ]
-    for alert in alerts:
-        emoji = SEVERITY_EMOJI.get(alert.get("severity", "low"), ":large_blue_circle:")
-        if alert.get("project"):
-            if alert.get("project_url"):
-                project_line = f"\n_Project: <{alert['project_url']}|{alert['project']}>_"
-            else:
-                project_line = f"\n_Project: {alert['project']}_"
-        else:
-            project_line = ""
-        text = f"{emoji}  *{alert['category']}*{project_line}\n{alert['description']}"
-        section = {"type": "section", "text": {"type": "mrkdwn", "text": text}}
-        if alert.get("url"):
-            section["accessory"] = {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Open in Basecamp"},
-                "url": alert["url"],
-            }
-        blocks.append(section)
-        blocks.append({"type": "divider"})
-    slack_client.chat_postMessage(
-        channel=channel_id, blocks=blocks,
-        text=f"Rick Stamen: {len(alerts)} alert(s) need your attention",
-    )
 
 
 def split_for_slack(text, max_size=2900):
@@ -1363,31 +1319,6 @@ def post_freeform_to_slack(slack_client, channel_id, text, fallback="Rick Stamen
 
 
 # ── Public API (used by webhook and job) ──────────────────────────────────────
-
-def run_analysis(on_demand=False):
-    """Hourly or on-demand alert scan. Returns list of new alerts."""
-    load_env()
-    load_secrets_from_gcp()
-    if token_needs_refresh():
-        refresh_bc_token()
-
-    state = load_state()
-    last_run = None if on_demand else state.get("last_run")
-
-    data = fetch_basecamp_data(last_run=last_run, mode="analysis")
-    result = analyze_with_claude(
-        anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]), data
-    )
-    alerts = result.get("alerts", [])
-
-    # Deduplicate
-    alerts, state = deduplicate_alerts(alerts, state)
-
-    if not on_demand:
-        state["last_run"] = datetime.now(timezone.utc).isoformat()
-    save_state(state)
-    return alerts
-
 
 def run_briefing():
     """Morning briefing — full project health summary."""
@@ -1459,8 +1390,7 @@ def main():
             print(f"ERROR: {var} not set")
             sys.exit(1)
 
-    mode = os.environ.get("RUN_MODE", "analysis")
-    on_demand = os.environ.get("ON_DEMAND", "false").lower() == "true"
+    mode = os.environ.get("RUN_MODE", "briefing")
     channel_id = os.environ["SLACK_CHANNEL_ID"]
     slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
 
@@ -1484,21 +1414,8 @@ def main():
         print("Drive audit posted.")
 
     else:
-        print(f"Running analysis (on_demand={on_demand})...")
-        alerts = run_analysis(on_demand=on_demand)
-        print(f"Found {len(alerts)} new alert(s)")
-        if alerts:
-            try:
-                title = "Rick Stamen (on-demand)" if on_demand else "Rick Stamen"
-                post_alerts_to_slack(slack_client, channel_id, alerts, title=title)
-                print(f"Posted {len(alerts)} alert(s) to Slack")
-            except SlackApiError as e:
-                print(f"Slack error: {e.response['error']}")
-        else:
-            if on_demand:
-                msg = ":white_check_mark: *All clear* — no issues found across active Skylark projects."
-                post_freeform_to_slack(slack_client, channel_id, msg)
-            print("All clear — nothing to post")
+        print(f"ERROR: unknown RUN_MODE={mode!r}. Expected briefing | deep_dive | drive_audit.")
+        sys.exit(1)
 
     print("Done.")
 
