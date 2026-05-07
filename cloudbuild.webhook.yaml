@@ -1,5 +1,8 @@
 steps:
-  - name: 'gcr.io/cloud-builders/docker'
+  # ── Build images in parallel ────────────────────────────────────────────────
+  - id: build-webhook
+    name: 'gcr.io/cloud-builders/docker'
+    waitFor: ['-']
     args:
       - build
       - -f
@@ -10,13 +13,40 @@ steps:
       - us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/webhook:latest
       - .
 
-  - name: 'gcr.io/cloud-builders/docker'
+  - id: build-agent
+    name: 'gcr.io/cloud-builders/docker'
+    waitFor: ['-']
+    args:
+      - build
+      - -f
+      - Dockerfile
+      - -t
+      - us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/agent:$COMMIT_SHA
+      - -t
+      - us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/agent:latest
+      - .
+
+  # ── Push both ──────────────────────────────────────────────────────────────
+  - id: push-webhook
+    name: 'gcr.io/cloud-builders/docker'
+    waitFor: ['build-webhook']
     args:
       - push
       - --all-tags
       - us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/webhook
 
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  - id: push-agent
+    name: 'gcr.io/cloud-builders/docker'
+    waitFor: ['build-agent']
+    args:
+      - push
+      - --all-tags
+      - us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/agent
+
+  # ── Deploy/update Cloud Run resources in parallel ─────────────────────────
+  - id: deploy-webhook
+    name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    waitFor: ['push-webhook']
     entrypoint: gcloud
     args:
       - run
@@ -26,9 +56,35 @@ steps:
       - --region=us-central1
       - --platform=managed
 
+  - id: update-job-pm-agent
+    name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    waitFor: ['push-agent']
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - update
+      - pm-agent
+      - --image=us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/agent:$COMMIT_SHA
+      - --region=us-central1
+
+  - id: update-job-briefing
+    name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    waitFor: ['push-agent']
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - update
+      - pm-agent-briefing
+      - --image=us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/agent:$COMMIT_SHA
+      - --region=us-central1
+
 images:
   - us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/webhook:$COMMIT_SHA
   - us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/webhook:latest
+  - us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/agent:$COMMIT_SHA
+  - us-central1-docker.pkg.dev/skylark-pm-agents/pm-agent/agent:latest
 
 options:
   logging: CLOUD_LOGGING_ONLY
