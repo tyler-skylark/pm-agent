@@ -827,8 +827,10 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
     incomplete_fetches = []
     cutoff_msg = cutoff_done = None
     if mode == "briefing":
-        cutoff_msg = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        cutoff_done = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+        # 14 days of messages is enough for "open thread" analysis. 30 days
+        # was producing 2.9MB bundles that overflowed the 800K char limit.
+        cutoff_msg = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+        cutoff_done = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
     for proj, sched_todos, labor_todos, proj_todos, client_vis_issues, messages, email_forwards, cards, sched_entries, fetch_incomplete in bundles:
         desc = proj.get("description", "")
@@ -1152,8 +1154,68 @@ These rules override anything else in this prompt. Before flagging an issue, the
 """
 
 
+def _render_anchor_block(data_bundle):
+    """Build a small, must-read summary that lives at the top of the prompt.
+
+    Truncation can drop fields buried in the JSON, and Claude tends to
+    hallucinate flags when the data looks "incomplete." Pre-rendering the
+    structured anchors as a clean Markdown block above the JSON forces him
+    to see them and uses literal data — not pattern matching — to flag.
+    """
+    vis = data_bundle.get("client_visibility_issues") or []
+    incomplete = data_bundle.get("incomplete_fetches") or []
+    labor = data_bundle.get("labor_todos") or []
+    summaries = data_bundle.get("project_summaries") or []
+
+    # Group visibility issues by project.
+    vis_by_proj = {}
+    for v in vis:
+        vis_by_proj.setdefault(v.get("project", "?"), []).append(
+            f"{v.get('list','?')} ({v.get('issue','?')})"
+        )
+
+    # Group labor by project.
+    labor_by_proj = {}
+    for l in labor:
+        labor_by_proj.setdefault(l.get("project", "?"), []).append(
+            l.get("title", "?")
+        )
+
+    lines = []
+    lines.append("## Anchor flags (READ THIS BEFORE ANY VISIBILITY/LABOR JUDGMENT)")
+    lines.append("")
+    lines.append("These are the ONLY pre-computed flag arrays. If a project name does not appear in `client_visibility_issues` below, its required client-visible lists ARE visible — do NOT flag it. Same for `incomplete_fetches`: only those projects had partial data.")
+    lines.append("")
+    if vis_by_proj:
+        lines.append("### client_visibility_issues (these projects have a real visibility problem)")
+        for proj, issues in sorted(vis_by_proj.items()):
+            lines.append(f"- {proj}: {', '.join(issues)}")
+    else:
+        lines.append("### client_visibility_issues: EMPTY")
+        lines.append("No project has a client-visibility problem. Do NOT flag any project for visibility.")
+    lines.append("")
+    if incomplete:
+        lines.append("### incomplete_fetches (data partial — surface, don't analyze)")
+        for entry in incomplete:
+            lines.append(f"- {entry.get('project','?')}")
+    else:
+        lines.append("### incomplete_fetches: EMPTY")
+        lines.append("All project data fetched cleanly.")
+    lines.append("")
+    if labor_by_proj:
+        lines.append(f"### labor_todos: {len(labor)} todo(s) across {len(labor_by_proj)} project(s)")
+        for proj, titles in sorted(labor_by_proj.items()):
+            lines.append(f"- {proj}: {len(titles)} labor todo(s) — {', '.join(titles[:3])}")
+    else:
+        lines.append("### labor_todos: NONE found across the account")
+    lines.append("")
+    lines.append(f"### Project count: {len(summaries)} active SKY project(s)")
+    return "\n".join(lines)
+
+
 def analyze_with_claude(anthropic_client, data_bundle):
     mode = data_bundle.get("mode", "briefing")
+    anchor_block = _render_anchor_block(data_bundle) if mode == "briefing" else ""
     full_data_json = json.dumps(data_bundle, indent=2)
     # ~800k chars is roughly 200k tokens — comfortably inside Opus 4.7's 1M
     # context but leaves room for the prompt itself and the response budget.
@@ -1161,7 +1223,7 @@ def analyze_with_claude(anthropic_client, data_bundle):
     truncated = len(full_data_json) > DATA_LIMIT
     data_json = full_data_json[:DATA_LIMIT]
     if truncated:
-        data_json += "\n\n[DATA TRUNCATED — original was {full} chars, kept {kept}]".format(
+        data_json += "\n\n[DATA TRUNCATED — original was {full} chars, kept {kept}. NOTE: the anchor block above is COMPLETE — flag decisions must come from there, not from inferring what's missing here.]".format(
             full=len(full_data_json), kept=DATA_LIMIT)
     print(f"analyze_with_claude: mode={mode} data_chars_full={len(full_data_json)} kept={len(data_json)} truncated={truncated}")
 
@@ -1171,6 +1233,8 @@ def analyze_with_claude(anthropic_client, data_bundle):
 {SKYLARK_SOP_CONTEXT}
 
 {REPORTING_DISCIPLINE}
+
+{anchor_block}
 
 Today is {data_bundle['as_of'][:10]}.
 
