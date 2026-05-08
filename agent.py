@@ -686,11 +686,20 @@ def audit_drive_folder(svc, proj):
                 "issues": ["no_drive_folder_found"]}
 
     issues = []
-    if len(hits) > 1:
-        issues.append(f"multiple_drive_folders_for_sky ({len(hits)})")
-
     project_folder = hits[0]
     project_folder_id = project_folder["id"]
+
+    # A "duplicate" is a SEPARATE top-level folder for the same SKY id —
+    # not a sub-folder buried inside the chosen project root. SKY-2689's
+    # engineering exports were tripping this flag because the export
+    # subfolder also contains the SKY id in its name. Filter out any
+    # candidate whose parent chain passes through project_folder_id.
+    true_duplicates = [
+        h for h in hits[1:]
+        if project_folder_id not in {fid for fid, _ in h.get("_chain", [])}
+    ]
+    if true_duplicates:
+        issues.append(f"multiple_drive_folders_for_sky ({len(true_duplicates) + 1})")
     drive_path = project_folder.get("_path") or project_folder["name"]
     drive_url = f"https://drive.google.com/drive/folders/{project_folder_id}"
     chain = project_folder.get("_chain", [])
@@ -1144,7 +1153,7 @@ The data bundle includes `drive_compliance` per project. Each entry has:
 - `matched_aliases` — where an alias was used (e.g. "Insurance Documents" matched "Insurance Docs")
 - `tree` — the actual folder + file structure (2-3 levels deep). Use this to reason beyond the template.
 - `days_since_drive_modified` — staleness signal
-- `issues` may include `drive_folder_outside_jobs_root` (folder name matches but lives somewhere outside Skylark Jobs — usually means a duplicate/orphan folder)
+- `issues` may include `drive_folder_outside_jobs_root` (folder name matches but lives somewhere outside Skylark Jobs — usually means a duplicate/orphan folder), or `multiple_drive_folders_for_sky (N)` (N truly independent top-level folders share this SKY id — sub-folders nested inside the chosen project root are excluded automatically, so this only fires for real duplicates)
 
 When linking to the Drive folder for Tyler, render it as a Slack link: `<DRIVE_URL|Drive folder>`.
 
