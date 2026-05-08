@@ -1154,6 +1154,36 @@ These rules override anything else in this prompt. Before flagging an issue, the
 """
 
 
+SLACK_FORMATTING = """### Slack formatting rules (your output goes to Slack as mrkdwn — NOT standard Markdown)
+
+Slack's mrkdwn syntax is similar to but distinct from GitHub Markdown. Standard Markdown will render literally as text. Use the Slack syntax exactly:
+
+| Element | Slack | NOT |
+|---------|-------|-----|
+| Bold | `*text*` (single asterisks) | `**text**` (renders as literal asterisks) |
+| Italic | `_text_` (single underscores) | `*text*` (would be bold) |
+| Strike | `~text~` | `~~text~~` |
+| Code | `` `text` `` | same |
+| Code block | triple backticks | same |
+| Link | `<URL|display text>` | `[display text](URL)` (renders as literal) |
+| Bullet | `• ` or `- ` (no markup) | `* ` would render as literal asterisk on some clients |
+| Quote | `> text` | same |
+| Emoji | `:red_circle:` | same |
+
+Headers do NOT exist in Slack mrkdwn. Do NOT use `#`, `##`, or `###` — they render as literal text. To make a section heading, use `*Section Name*` (bold) on its own line, optionally with a leading emoji.
+
+Section dividers: a line with just `———` or `---` works visually but doesn't render as a horizontal rule. Better: leave a blank line between sections.
+
+When you reference a SKY project, ALWAYS render it as `<APP_URL|SKY-XXXX>` using the project's `app_url` from `project_summaries`. Never use `[SKY-XXXX](url)` — that's GitHub Markdown and Slack will print the brackets literally.
+
+Per-line examples:
+- Right: `:red_circle: *SKY-2429* — install <https://3.basecamp.com/.../todos/123|5/19> blocked: missing GO/NO-GO`
+- Wrong: `🔴 **SKY-2429** — install [5/19](https://3.basecamp.com/.../todos/123) blocked: missing GO/NO-GO`
+
+The first renders cleanly. The second renders raw asterisks and brackets in the message.
+"""
+
+
 def _render_anchor_block(data_bundle):
     """Build a small, must-read summary that lives at the top of the prompt.
 
@@ -1234,26 +1264,25 @@ def analyze_with_claude(anthropic_client, data_bundle):
 
 {REPORTING_DISCIPLINE}
 
+{SLACK_FORMATTING}
+
 {anchor_block}
 
 Today is {data_bundle['as_of'][:10]}.
 
 The data below includes EVERY active SKY project with ALL todos (all_todos), ALL messages and comments (messages_and_comments), ALL cards (cards), `upcoming_schedule_entries` (Basecamp Schedule dock — events/calendar entries), labor todos, AND `drive_compliance` (Google Drive job folder audit per project). Use all of it. Drive is a primary data source — not optional context.
 
-Review all active project data below and produce a clear morning briefing in Slack markdown.
+Review all active project data and produce the briefing.
 
-Format:
-- Start with a one-line summary count (e.g. "12 active jobs — 3 need attention")
-- List jobs needing action first (with specific issue)
-- Then jobs that are all-clear (just name + current phase)
-- If `incomplete_fetches` has any entries, list them in a small "Data fetch incomplete" section so Tyler knows to re-run — do not analyze those projects' content
-- After the per-project list, include a *Drive Health* section: any project with missing top-level folders, empty required folders, no Drive folder found, or `drive_folder_outside_jobs_root`. Use the `tree` to avoid false positives (alias matches, signed contracts in Contract Revisions/Signed Documents, etc.). Render the Drive folder as `<DRIVE_URL|Drive>` so Tyler can click through.
-- End with a "This Week" section: key milestones due in the next 7 days across all jobs
+Structure:
+1. *One-line summary* — e.g. `47 active jobs — 5 need attention, 1 fetch incomplete`
+2. *Needs attention* — jobs with real issues (each with `:red_circle:` or `:large_yellow_circle:`, specific todo/person/date)
+3. *Data fetch incomplete* (only if `incomplete_fetches` is non-empty) — list those projects, do NOT analyze them
+4. *All clear* — `:white_check_mark:` per project, name + current phase, one short line each
+5. *Drive Health* — projects with missing top-level folders, empty required folders, `no_drive_folder_found`, or `drive_folder_outside_jobs_root`. Use the `tree` to avoid false positives (alias matches, signed contracts in Contract Revisions/Signed Documents, etc.). Render Drive folder as `<DRIVE_URL|Drive>`.
+6. *This Week* — milestones due in the next 7 days across all jobs
 
-Use :red_circle: for high issues, :large_yellow_circle: for medium, :white_check_mark: for clear.
-Be specific — name the todo, the person, the date.
-
-ALWAYS render every project name as a clickable Slack link using the project's `app_url` from `project_summaries`. Format: `<APP_URL|SKY-XXXX>` — angle brackets, URL, pipe, display text. Never write a bare `SKY-XXXX` when an app_url is available. This applies to every mention in every section: headers, bullets, inline references. Tyler should be able to click any project name to jump straight to it.
+Severity emoji: `:red_circle:` for high, `:large_yellow_circle:` for medium, `:white_check_mark:` for clear.
 
 --- DATA ---
 {data_json}
@@ -1276,11 +1305,13 @@ ALWAYS render every project name as a clickable Slack link using the project's `
 
 {REPORTING_DISCIPLINE}
 
+{SLACK_FORMATTING}
+
 As of {data_bundle['as_of'][:10]}.
 
 The data below includes EVERY todo, message, comment, card, and schedule entry for this project. Use all of it — don't skip anything.
 
-Cover:
+Cover (each as its own `*Section*` line):
 1. Project description fields (PM, Engineer, On-Site Lead, Client Contact)
 2. Current active phase (based on incomplete schedule-tagged todos with due dates)
 3. All open todos by list — who owns what, what's overdue, what's missing dates
@@ -1289,12 +1320,10 @@ Cover:
 6. Card table status (if present — what's in each column, anything blocked or stale)
 7. Full message/comment thread review — tone, open questions, anything unresolved
 8. Any SOP violations or engineering milestone flags
-9. *Drive folder review* — use `drive_compliance` from the data bundle. Confirm the resolved `drive_path`, link the `drive_url` as `<DRIVE_URL|Drive folder>`, and call out missing/empty required folders, stale activity, or "Damaged Product"-style sub-folders that hint at incidents. Use the `tree` to spot real evidence (signed contracts, current drawings, vendor docs, photos). Cross-reference Drive activity against Basecamp phase — design-phase project missing onsite photos is normal; onsite-phase project missing them is a flag.
-10. Overall health: GREEN / YELLOW / RED with one-line reason
+9. Drive folder review — use `drive_compliance`. Confirm the resolved `drive_path`, link the `drive_url` as `<DRIVE_URL|Drive folder>`, call out missing/empty required folders, stale activity, or "Damaged Product"-style sub-folders that hint at incidents. Use the `tree` to spot real evidence. Cross-reference Drive activity against Basecamp phase.
+10. Overall health: `:large_green_circle: GREEN` / `:large_yellow_circle: YELLOW` / `:red_circle: RED` with one-line reason
 
-Use Slack markdown. Be thorough — Tyler wants the full picture.
-
-Render the project name in the report header as a clickable Slack link using its `app_url` from `project_summaries`. Format: `<APP_URL|SKY-XXXX>`. Same rule for any other project you reference — make every SKY mention clickable.
+Be thorough — Tyler wants the full picture.
 
 --- DATA ---
 {data_json}
@@ -1314,20 +1343,22 @@ Render the project name in the report header as a clickable Slack link using its
 
 {SKYLARK_SOP_CONTEXT}
 
+{SLACK_FORMATTING}
+
 As of {data_bundle['as_of'][:10]}.
 
 The data below contains every active SKY project's `drive_compliance` entry. Each has the resolved `drive_path`, `drive_url`, missing folders, empty folders, days-since-modified, and a 3-level `tree` of actual contents.
 
-Produce a Slack-formatted report focused ENTIRELY on Drive health. Do NOT discuss Basecamp todos, messages, or schedule — this is Drive-only.
+Produce a report focused ENTIRELY on Drive health. Do NOT discuss Basecamp todos, messages, or schedule — this is Drive-only.
 
-Format:
-- One-line summary at top: "X jobs audited — Y need attention"
-- *Critical* section: any project with `no_drive_folder_found`, `drive_folder_outside_jobs_root`, or missing top-level folders that are needed for the project's phase
-- *Empty / Stale* section: required folders that are present but empty (and the project is past the phase that should have populated them), folders untouched for 30+ days on active projects
-- *Naming / Layout Issues* section: folders that don't follow `Skylark Jobs > Client > SKY-XXXX | Job Name`, or sub-folders the ranker had to filter (Install Share Folder, Damaged Product, etc.)
-- *All Clear* section: jobs whose Drive folder is healthy — just SKY-id + a short note
+Structure:
+1. One-line summary: e.g. `47 jobs audited — 6 need attention`
+2. *Critical* — projects with `no_drive_folder_found`, `drive_folder_outside_jobs_root`, or missing phase-required top-level folders
+3. *Empty / Stale* — required folders present but empty past their phase, or folders untouched for 30+ days on active jobs
+4. *Naming / Layout Issues* — folders not following `Skylark Jobs > Client > SKY-XXXX | Job Name`, or sub-folders the ranker had to filter (Install Share Folder, Damaged Product, etc.)
+5. *All Clear* — healthy Drive folders, one short line each
 
-Use :red_circle: for critical, :large_yellow_circle: for medium, :white_check_mark: for clear. Always render every project as a clickable link using `app_url` from `project_summaries`: `<APP_URL|SKY-XXXX>`. Always render the Drive folder as `<DRIVE_URL|Drive>` so Tyler can click through.
+Severity emoji: `:red_circle:` critical, `:large_yellow_circle:` medium, `:white_check_mark:` clear. Render every project as `<APP_URL|SKY-XXXX>`. Render the Drive folder as `<DRIVE_URL|Drive>`.
 
 Apply the REAL-WORLD RULE — use `tree` to avoid false positives. `Insurance Docs/` with a COI satisfies `Insurance Documents/`; a signed contract in `Contract Revisions/Signed Documents/` satisfies `Signed Contracts/`. Don't flag template-name mismatches when functional evidence is there. Cross-reference Basecamp phase from `project_summaries` — missing onsite photos on a design-phase project is normal.
 
