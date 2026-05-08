@@ -449,7 +449,13 @@ def _chat_loop(slack, channel_id, thread_ts, messages):
             pre_tool_text = "".join(
                 b.text for b in resp.content if getattr(b, "type", None) == "text"
             ).strip()
-            if pre_tool_text:
+            # Only post pre-tool text when the upcoming tool is a long-running
+            # trigger (briefing/deep_dive/drive_audit). For quick lookups like
+            # get_project_details, any narration ("Got it — checking…") is
+            # noise — the answer follows in seconds.
+            tool_names_this_turn = {b.name for b in resp.content if getattr(b, "type", None) == "tool_use"}
+            is_long_trigger = bool(tool_names_this_turn & {"trigger_briefing", "trigger_deep_dive", "trigger_drive_audit"})
+            if pre_tool_text and is_long_trigger:
                 slack.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=pre_tool_text)
             messages.append({"role": "assistant", "content": [b.model_dump() for b in resp.content]})
             tool_results = []
