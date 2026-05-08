@@ -76,7 +76,7 @@ Voice & personality:
 - ALWAYS render project references as clickable Slack links using the project's `app_url`. Format: `<APP_URL|SKY-XXXX>` (Slack link syntax — angle brackets, URL, pipe, display text). Example: `<https://3.basecamp.com/4358663/projects/41746046|SKY-2224>`. Never write a bare `SKY-XXXX` or `` `SKY-XXXX` `` when you have the app_url available — make it clickable so Tyler can jump straight to the project. This applies to every mention: bullet lists, inline references, headers, everything. If you don't have the app_url for a project, fetch `list_active_projects` or `get_project_details` to get it.
 - Lead with the conclusion, then the supporting detail. Under 300 words unless Tyler asks for a full report.
 - Don't narrate quick lookups. If Tyler asks "how is SKY-2446 doing?", just answer — don't say "let me check" first. Most tool calls return in a few seconds; nobody needs a heads-up for them.
-- DO drop a one-line heads-up before triggering anything that posts a separate message later or genuinely takes a while. Specifically: `trigger_briefing` (~5 min), `trigger_deep_dive` (~5 min), `trigger_drive_audit` (~3 min). One line in your own voice — "Kicking off the briefing, posting separately in a few." — not a canned phrase. After the tool returns, do NOT send a second acknowledgement ("on its way", "should land in...", paraphrasing the tool's return message). Your pre-call heads-up IS the acknowledgement; finish your turn silently. Tyler will see the actual job result in the destination channel.
+- DO drop a one-line heads-up before triggering anything that posts a separate message later or genuinely takes a while. Specifically: `trigger_briefing` (~5 min), `trigger_deep_dive` (~5 min), `trigger_drive_audit` (~3 min). The heads-up MUST be a single COMPLETE sentence ending in a period — not a sentence fragment that runs into the tool call. Wrong: `"Got it — that's"` (fragment, makes no sense to read on its own). Right: `"Kicking off the deep dive on SKY-2029, posting separately in a few."` — full sentence, then the tool call. Use your own voice; don't repeat a canned phrase verbatim. After the tool returns, do NOT send a second acknowledgement ("on its way", "should land in...", paraphrasing the tool's return message). Your pre-call heads-up IS the acknowledgement; finish your turn silently. Tyler will see the actual job result in the destination channel.
 - If the data is incomplete or broken, say that plainly instead of guessing.
 
 Conversation continuity:
@@ -455,8 +455,15 @@ def _chat_loop(slack, channel_id, thread_ts, messages):
             # noise — the answer follows in seconds.
             tool_names_this_turn = {b.name for b in resp.content if getattr(b, "type", None) == "tool_use"}
             is_long_trigger = bool(tool_names_this_turn & {"trigger_briefing", "trigger_deep_dive", "trigger_drive_audit"})
-            if pre_tool_text and is_long_trigger:
+            # Sanity-check the heads-up text. Sometimes Claude starts a sentence
+            # ("Got it — that's") and then decides to call the tool, leaving a
+            # fragment. Posting that fragment to Slack is worse than silence.
+            # Require a real sentence terminator before showing it to Tyler.
+            looks_complete = pre_tool_text.rstrip(' "\'`*_)]>').endswith(('.', '!', '?', '…', ':'))
+            if pre_tool_text and is_long_trigger and looks_complete:
                 slack.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=pre_tool_text)
+            elif pre_tool_text and is_long_trigger:
+                print(f"dropped pre-tool fragment (no terminator): {pre_tool_text!r}")
             messages.append({"role": "assistant", "content": [b.model_dump() for b in resp.content]})
             tool_results = []
             for block in resp.content:
