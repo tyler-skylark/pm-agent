@@ -1154,33 +1154,44 @@ These rules override anything else in this prompt. Before flagging an issue, the
 """
 
 
-SLACK_FORMATTING = """### Slack formatting rules (your output goes to Slack as mrkdwn — NOT standard Markdown)
+SLACK_FORMATTING = """### Slack formatting rules (your output goes to Slack as mrkdwn — NOT standard Markdown, NOT HTML)
 
-Slack's mrkdwn syntax is similar to but distinct from GitHub Markdown. Standard Markdown will render literally as text. Use the Slack syntax exactly:
+Your output is posted to Slack. Slack's mrkdwn syntax is its own thing — it is NOT GitHub Markdown and it is NOT HTML. Standard Markdown and HTML render as LITERAL TEXT.
 
-| Element | Slack | NOT |
-|---------|-------|-----|
-| Bold | `*text*` (single asterisks) | `**text**` (renders as literal asterisks) |
-| Italic | `_text_` (single underscores) | `*text*` (would be bold) |
+ABSOLUTE PROHIBITIONS — these MUST NOT appear anywhere in your output:
+- No HTML. The character sequence `<a ` (opening anchor tag) must NEVER appear. No `<p>`, `<div>`, `<span>`, `<br>`, `<strong>`, `<em>`, etc. The ONLY use of `<` in your output is the start of a Slack link `<URL|text>`.
+- No `**double asterisks**` for bold — Slack prints them literally. Use `*single asterisks*`.
+- No `[text](URL)` — that's GitHub Markdown and prints literal brackets. Use `<URL|text>`.
+- No `# Header` / `## Header` / `### Header` — Slack has no header syntax. Use `*Bold*` on its own line.
+- No URL-encoding of the `|` separator inside a Slack link. The pipe is a literal `|` character — never `%7C`.
+
+The CORRECT Slack mrkdwn syntax:
+
+| Element | Right | Wrong |
+|---------|-------|-------|
+| Bold | `*text*` | `**text**` |
+| Italic | `_text_` | `*text*` |
 | Strike | `~text~` | `~~text~~` |
-| Code | `` `text` `` | same |
+| Inline code | `` `text` `` | same |
 | Code block | triple backticks | same |
-| Link | `<URL|display text>` | `[display text](URL)` (renders as literal) |
-| Bullet | `• ` or `- ` (no markup) | `* ` would render as literal asterisk on some clients |
+| Link | `<https://example.com|display>` | `[display](url)` or `<a href="url">display</a>` |
+| Bullet | `• item` or `- item` | `* item` (renders literal `*`) |
 | Quote | `> text` | same |
 | Emoji | `:red_circle:` | same |
+| Header | `*Section Name*` on its own line | `## Section Name` |
 
-Headers do NOT exist in Slack mrkdwn. Do NOT use `#`, `##`, or `###` — they render as literal text. To make a section heading, use `*Section Name*` (bold) on its own line, optionally with a leading emoji.
+Project links — the rule that matters most: when you reference a SKY project, render it as `<APP_URL|SKY-XXXX>` using the project's `app_url` from `project_summaries`. Concrete example with the correct shape:
 
-Section dividers: a line with just `———` or `---` works visually but doesn't render as a horizontal rule. Better: leave a blank line between sections.
+  Right: `<https://3.basecamp.com/4358663/projects/46926746|SKY-2647>`
+  Wrong: `<a href="https://3.basecamp.com/4358663/projects/46926746|SKY-2647">SKY-2647</a>`
+  Wrong: `[SKY-2647](https://3.basecamp.com/4358663/projects/46926746)`
+  Wrong: `<https://3.basecamp.com/4358663/projects/46926746%7CSKY-2647>`
 
-When you reference a SKY project, ALWAYS render it as `<APP_URL|SKY-XXXX>` using the project's `app_url` from `project_summaries`. Never use `[SKY-XXXX](url)` — that's GitHub Markdown and Slack will print the brackets literally.
+Per-line example showing all the rules together:
+  Right: `:red_circle: *SKY-2429* — install <https://3.basecamp.com/4358663/buckets/45754447/todos/123|5/19> blocked: missing GO/NO-GO`
+  Wrong: `🔴 **SKY-2429** — install [5/19](https://3.basecamp.com/4358663/buckets/45754447/todos/123) blocked: missing GO/NO-GO`
 
-Per-line examples:
-- Right: `:red_circle: *SKY-2429* — install <https://3.basecamp.com/.../todos/123|5/19> blocked: missing GO/NO-GO`
-- Wrong: `🔴 **SKY-2429** — install [5/19](https://3.basecamp.com/.../todos/123) blocked: missing GO/NO-GO`
-
-The first renders cleanly. The second renders raw asterisks and brackets in the message.
+If you ever feel tempted to write `<a href` — STOP. That's HTML. Convert it to `<URL|text>` Slack syntax instead.
 """
 
 
