@@ -9,6 +9,7 @@ import json
 import os
 import re
 import threading
+from contextvars import ContextVar
 from datetime import datetime, timezone, timedelta
 
 import anthropic
@@ -35,6 +36,12 @@ CHAT_MODEL = "claude-sonnet-4-6"
 CHAT_MAX_TOKENS = 3000
 CHAT_TOOL_LOOP_LIMIT = 8
 THREAD_HISTORY_LIMIT = 30
+
+# Origin of the current request (channel + thread). Set by _chat_loop before
+# tools run so trigger_* tools can route their long-running output back to
+# wherever the user actually asked — DM, public channel, or a thread inside
+# either — instead of always posting to #pm-watch.
+_current_request: ContextVar[dict] = ContextVar("_current_request", default={})
 
 ACK_PHRASES = [
     ":eyes: On it.",
@@ -68,7 +75,7 @@ Voice & personality:
 - ALWAYS render project references as clickable Slack links using the project's `app_url`. Format: `<APP_URL|SKY-XXXX>` (Slack link syntax — angle brackets, URL, pipe, display text). Example: `<https://3.basecamp.com/4358663/projects/41746046|SKY-2224>`. Never write a bare `SKY-XXXX` or `` `SKY-XXXX` `` when you have the app_url available — make it clickable so Tyler can jump straight to the project. This applies to every mention: bullet lists, inline references, headers, everything. If you don't have the app_url for a project, fetch `list_active_projects` or `get_project_details` to get it.
 - Lead with the conclusion, then the supporting detail. Under 300 words unless Tyler asks for a full report.
 - Don't narrate quick lookups. If Tyler asks "how is SKY-2446 doing?", just answer — don't say "let me check" first. Most tool calls return in a few seconds; nobody needs a heads-up for them.
-- DO drop a one-line heads-up before triggering anything that posts a separate message later or genuinely takes a while. Specifically: `trigger_briefing` (~5 min), `trigger_deep_dive` (~5 min), `trigger_drive_audit` (~3 min). One line in your own voice — "Kicking off the briefing, posting separately in a few." — not a canned phrase.
+- DO drop a one-line heads-up before triggering anything that posts a separate message later or genuinely takes a while. Specifically: `trigger_briefing` (~5 min), `trigger_deep_dive` (~5 min), `trigger_drive_audit` (~3 min). One line in your own voice — "Kicking off the briefing, posting separately in a few." — not a canned phrase. After the tool returns, do NOT send a second acknowledgement ("on its way", "should land in...", paraphrasing the tool's return message). Your pre-call heads-up IS the acknowledgement; finish your turn silently. Tyler will see the actual job result in the destination channel.
 - If the data is incomplete or broken, say that plainly instead of guessing.
 
 Conversation continuity:
@@ -176,7 +183,7 @@ CHAT_TOOLS = [
     },
     {
         "name": "trigger_briefing",
-        "description": "Kick off the full morning briefing job. Posts a separate message to #pm-watch when complete (~5 min). Use for 'give me a briefing' or 'full sweep'.",
+        "description": "Kick off the full morning briefing job. Posts a separate message in this same conversation (DM or thread where Tyler asked) when complete (~5 min). Use for 'give me a briefing' or 'full sweep'.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
@@ -192,7 +199,7 @@ CHAT_TOOLS = [
     },
     {
         "name": "trigger_drive_audit",
-        "description": "Kick off a Google Drive audit across EVERY active SKY project. Reports missing folders, empty required folders, naming/layout issues, and zero-candidate projects. Posts separately to #pm-watch when complete (~3 min). Use when Tyler asks for 'a drive audit', 'check the drive', 'are all the drive folders set up', or similar cross-project Drive questions.",
+        "description": "Kick off a Google Drive audit across EVERY active SKY project. Reports missing folders, empty required folders, naming/layout issues, and zero-candidate projects. Posts separately in this same conversation (DM or thread where Tyler asked) when complete (~3 min). Use when Tyler asks for 'a drive audit', 'check the drive', 'are all the drive folders set up', or similar cross-project Drive questions.",
         "input_schema": {"type": "object", "properties": {}},
     },
 ]
@@ -358,8 +365,10 @@ def tool_trigger_drive_audit():
 def _trigger_job_external(mode, project_query=None):
     """Import lazily to avoid webhook → chat circular import."""
     from webhook import trigger_job
-    channel = os.environ.get("SLACK_CHANNEL_ID", os.environ.get("PM_WATCH_CHANNEL_ID", ""))
-    trigger_job(mode, channel, project_query)
+    origin = _current_request.get() or {}
+    channel = origin.get("channel_id") or os.environ.get("SLACK_CHANNEL_ID", os.environ.get("PM_WATCH_CHANNEL_ID", ""))
+    thread_ts = origin.get("thread_ts")
+    trigger_job(mode, channel, project_query, thread_ts=thread_ts)
 
 
 TOOL_DISPATCH = {
@@ -424,6 +433,7 @@ def _build_message_history(slack, channel_id, thread_ts, fallback_text):
 
 
 def _chat_loop(slack, channel_id, thread_ts, messages):
+    _current_request.set({"channel_id": channel_id, "thread_ts": thread_ts})
     client = anthropic.Anthropic()
     for _ in range(CHAT_TOOL_LOOP_LIMIT):
         resp = client.messages.create(

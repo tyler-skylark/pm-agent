@@ -91,7 +91,7 @@ def get_gcp_token():
         return json.loads(resp.read())["access_token"]
 
 
-def trigger_job(mode, channel_id, project_query=None):
+def trigger_job(mode, channel_id, project_query=None, thread_ts=None):
     """Trigger the pm-agent Cloud Run Job with env overrides — runs independently."""
     try:
         token = get_gcp_token()
@@ -103,6 +103,8 @@ def trigger_job(mode, channel_id, project_query=None):
         ]
         if project_query:
             env.append({"name": "PROJECT_QUERY", "value": project_query})
+        if thread_ts:
+            env.append({"name": "SLACK_THREAD_TS", "value": thread_ts})
 
         url = (f"https://run.googleapis.com/v2/projects/{GCP_PROJECT}"
                f"/locations/{GCP_REGION}/jobs/{JOB_NAME}:run")

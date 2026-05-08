@@ -1424,14 +1424,18 @@ def split_for_slack(text, max_size=2900):
     return chunks
 
 
-def post_freeform_to_slack(slack_client, channel_id, text, fallback="Rick Stamen update"):
+def post_freeform_to_slack(slack_client, channel_id, text, fallback="Rick Stamen update", thread_ts=None):
     chunks = split_for_slack(text)
     for i, chunk in enumerate(chunks):
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": chunk}}]
-        slack_client.chat_postMessage(
-            channel=channel_id, blocks=blocks,
-            text=fallback if i == 0 else f"{fallback} (cont.)",
-        )
+        kwargs = {
+            "channel": channel_id,
+            "blocks": blocks,
+            "text": fallback if i == 0 else f"{fallback} (cont.)",
+        }
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        slack_client.chat_postMessage(**kwargs)
 
 
 # ── Public API (used by webhook and job) ──────────────────────────────────────
@@ -1508,25 +1512,26 @@ def main():
 
     mode = os.environ.get("RUN_MODE", "briefing")
     channel_id = os.environ["SLACK_CHANNEL_ID"]
+    thread_ts = os.environ.get("SLACK_THREAD_TS") or None
     slack_client = WebClient(token=os.environ["SLACK_TOKEN"])
 
     if mode == "briefing":
         print("Running briefing...")
         text = run_briefing()
-        post_freeform_to_slack(slack_client, channel_id, text, "Skylark PM Briefing")
+        post_freeform_to_slack(slack_client, channel_id, text, "Skylark PM Briefing", thread_ts=thread_ts)
         print("Briefing posted.")
 
     elif mode == "deep_dive":
         project_query = os.environ.get("PROJECT_QUERY", "")
         print(f"Running deep dive: {project_query}")
         text = run_deep_dive(project_query)
-        post_freeform_to_slack(slack_client, channel_id, text, f"Deep Dive: {project_query}")
+        post_freeform_to_slack(slack_client, channel_id, text, f"Deep Dive: {project_query}", thread_ts=thread_ts)
         print("Deep dive posted.")
 
     elif mode == "drive_audit":
         print("Running drive audit across active SKY projects...")
         text = run_drive_audit()
-        post_freeform_to_slack(slack_client, channel_id, text, "Drive Audit")
+        post_freeform_to_slack(slack_client, channel_id, text, "Drive Audit", thread_ts=thread_ts)
         print("Drive audit posted.")
 
     else:
