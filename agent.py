@@ -226,6 +226,22 @@ def fetch_active_sky_projects(projects):
 REQUIRED_CLIENT_VISIBLE_LISTS = {"Onsite Phase", "Commissioning Phase", "Closeout Phase"}
 
 
+def classify_project_type(name):
+    """Return 'Design Contract', 'Sales', or 'Standard Project'.
+
+    Sales projects are large, pre-contract opportunities still in sales
+    engineering. Like Design Contracts, they use the standard project
+    template but most SOPs don't apply yet — Rick should ONLY flag
+    hanging conversations on them.
+    """
+    n = name or ""
+    if "(Design Contract)" in n:
+        return "Design Contract"
+    if "(Sales)" in n:
+        return "Sales"
+    return "Standard Project"
+
+
 def fetch_todos_for_project(proj):
     """Returns (schedule_todos, labor_todos, all_todos, client_visibility_issues, fetch_incomplete).
 
@@ -834,12 +850,12 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
 
     for proj, sched_todos, labor_todos, proj_todos, client_vis_issues, messages, email_forwards, cards, sched_entries, fetch_incomplete in bundles:
         desc = proj.get("description", "")
-        is_design_contract = "(Design Contract)" in proj.get("name", "")
+        proj_type = classify_project_type(proj.get("name", ""))
         project_summaries.append({
             "id": proj["id"],
             "name": proj["name"],
             "description": desc[:500],
-            "type": "Design Contract" if is_design_contract else "Standard Project",
+            "type": proj_type,
             "app_url": proj.get("app_url"),
             "fetch_incomplete": fetch_incomplete,
         })
@@ -863,7 +879,10 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
         all_messages.extend(email_forwards)
         all_cards.extend(cards)
         schedule_entries.extend(sched_entries)
-        if not is_design_contract:
+        # Visibility flags don't apply to pre-execution projects (Design
+        # Contract or Sales) — those use the same template but aren't
+        # expected to be SOP-compliant yet.
+        if proj_type == "Standard Project":
             all_client_visibility_issues.extend(client_vis_issues)
 
     drive_compliance = audit_drive_for_projects(projects_to_fetch)
@@ -895,8 +914,9 @@ SKYLARK_SOP_CONTEXT = """
 ## Skylark AV Operations Standards
 
 ### Project Types
-Skylark has two types of SKY- projects:
+Skylark has three types of SKY- projects:
 - **Design Contract** — pre-execution, design/engineering phase only. Project name includes "(Design Contract)". TBD fields are acceptable. Full SOP compliance (install scheduling, labor, procurement) is NOT expected.
+- **Sales** — pre-contract, large opportunity in sales engineering. Project name includes "(Sales)". Uses the standard project template but most SOPs do NOT apply until contract is signed and the (Sales) tag is removed. The ONLY thing to flag on a (Sales) project is *hanging conversations* — a question or request from the client (or internal team) in `messages_and_comments` that has no reply for 3+ days. Do NOT flag missing schedule, missing labor, missing client visibility, missing dates, or any other SOP item on (Sales) projects.
 - **Standard Project** — full execution project. All description fields required, no TBDs, full SOP applies.
 
 ### Project Description (Required Fields)
@@ -907,7 +927,7 @@ Every active SKY- project must have exactly these 5 fields in its description:
 - Engineer
 - On-Site Lead
 No dates are expected in the description. Dates live in schedule-tagged todos only.
-TBD is only acceptable for Design Contract projects (not Standard Projects).
+TBD is only acceptable for Design Contract and (Sales) projects (not Standard Projects).
 
 ### Schedule Tag System
 [PM-SCHED] [ENG-SCHED] [PROC-SCHED] [SHOP-SCHED] [LOG-SCHED] [ONS-SCHED] [COM-SCHED] [FUT-SCHED]
@@ -1208,6 +1228,11 @@ def _render_anchor_block(data_bundle):
     labor = data_bundle.get("labor_todos") or []
     summaries = data_bundle.get("project_summaries") or []
 
+    # Bucket projects by type so the prompt can scope its rules properly.
+    sales_projects = [s for s in summaries if s.get("type") == "Sales"]
+    design_projects = [s for s in summaries if s.get("type") == "Design Contract"]
+    standard_projects = [s for s in summaries if s.get("type") == "Standard Project"]
+
     # Group visibility issues by project.
     vis_by_proj = {}
     for v in vis:
@@ -1250,7 +1275,17 @@ def _render_anchor_block(data_bundle):
     else:
         lines.append("### labor_todos: NONE found across the account")
     lines.append("")
-    lines.append(f"### Project count: {len(summaries)} active SKY project(s)")
+    lines.append(f"### Project count: {len(summaries)} active — {len(standard_projects)} Standard, {len(design_projects)} Design Contract, {len(sales_projects)} Sales")
+    if sales_projects:
+        lines.append("")
+        lines.append("### Sales projects (apply ONLY the hanging-conversation rule, no other SOP checks)")
+        for s in sales_projects:
+            lines.append(f"- {s.get('name','?')}")
+    if design_projects:
+        lines.append("")
+        lines.append("### Design Contract projects (pre-execution — TBD fields OK, no install SOP yet)")
+        for s in design_projects:
+            lines.append(f"- {s.get('name','?')}")
     return "\n".join(lines)
 
 
@@ -1285,13 +1320,21 @@ The data below includes EVERY active SKY project with ALL todos (all_todos), ALL
 
 Review all active project data and produce the briefing.
 
+Project type rules (apply per-project before flagging):
+- **Standard Project** — full SOP applies. All sections below apply.
+- **Design Contract** — pre-execution. Skip install/labor/visibility/schedule-tag SOP checks. Flag only: missing description fields, hanging conversations, or stalled engineering with no recent activity.
+- **Sales** — pre-contract opportunity in sales engineering. Apply ONLY the hanging-conversation rule below. Do NOT flag missing schedule, missing labor, missing client visibility, missing dates, or any other SOP item. Sales projects don't have an install yet — silence on those is normal.
+
+Hanging conversation rule (applies to ALL three project types): a question or request from the client OR an internal teammate in `messages_and_comments` that has no reply for 3+ days is "hanging." Cite the parent_title and the asker. Skip if a later comment in the same thread answers it.
+
 Structure:
 1. *One-line summary* — e.g. `47 active jobs — 5 need attention, 1 fetch incomplete`
 2. *Needs attention* — jobs with real issues (each with `:red_circle:` or `:large_yellow_circle:`, specific todo/person/date)
 3. *Data fetch incomplete* (only if `incomplete_fetches` is non-empty) — list those projects, do NOT analyze them
-4. *All clear* — `:white_check_mark:` per project, name + current phase, one short line each
-5. *Drive Health* — projects with missing top-level folders, empty required folders, `no_drive_folder_found`, or `drive_folder_outside_jobs_root`. Use the `tree` to avoid false positives (alias matches, signed contracts in Contract Revisions/Signed Documents, etc.). Render Drive folder as `<DRIVE_URL|Drive>`.
-6. *This Week* — milestones due in the next 7 days across all jobs
+4. *Sales watch* (only if any (Sales) projects exist) — for each (Sales) project: `:white_check_mark:` if no hanging conversation, `:large_yellow_circle:` if there is one (cite parent_title, asker, age in days). Nothing else.
+5. *All clear* — `:white_check_mark:` per project, name + current phase, one short line each
+6. *Drive Health* — projects with missing top-level folders, empty required folders, `no_drive_folder_found`, or `drive_folder_outside_jobs_root`. Use the `tree` to avoid false positives (alias matches, signed contracts in Contract Revisions/Signed Documents, etc.). Render Drive folder as `<DRIVE_URL|Drive>`.
+7. *This Week* — milestones due in the next 7 days across all jobs (Standard Projects only — Sales/Design Contract milestones aren't tracked here)
 
 Severity emoji: `:red_circle:` for high, `:large_yellow_circle:` for medium, `:white_check_mark:` for clear.
 
@@ -1465,7 +1508,7 @@ def run_drive_audit():
     sky = fetch_active_sky_projects(projects)
     project_summaries = [{
         "id": p["id"], "name": p["name"], "app_url": p.get("app_url"),
-        "is_design": "(Design Contract)" in p.get("name", ""),
+        "type": classify_project_type(p.get("name", "")),
     } for p in sky]
     drive_compliance = audit_drive_for_projects(sky)
 

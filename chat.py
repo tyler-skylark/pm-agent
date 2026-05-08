@@ -20,6 +20,7 @@ from agent import (
     SKYLARK_SOP_CONTEXT,
     audit_drive_folder,
     bc_get_all,
+    classify_project_type,
     drive_find_project_folder,
     fetch_active_sky_projects,
     fetch_cards_for_project,
@@ -234,7 +235,7 @@ def tool_list_active_projects():
             "id": p["id"],
             "name": p["name"],
             "description": (p.get("description") or "")[:400],
-            "type": "Design Contract" if "(Design Contract)" in p.get("name", "") else "Standard Project",
+            "type": classify_project_type(p.get("name", "")),
             "app_url": p.get("app_url"),
         }
         for p in sky
@@ -266,7 +267,7 @@ def tool_get_project_details(sky_id_or_name):
             "id": proj["id"],
             "name": proj["name"],
             "description": proj.get("description", ""),
-            "type": "Design Contract" if "(Design Contract)" in proj.get("name", "") else "Standard Project",
+            "type": classify_project_type(proj.get("name", "")),
             "app_url": proj.get("app_url"),
         },
         "todos_count": len(todos),
