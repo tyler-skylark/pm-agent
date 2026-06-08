@@ -225,6 +225,16 @@ def fetch_active_sky_projects(projects):
 
 REQUIRED_CLIENT_VISIBLE_LISTS = {"Onsite Phase", "Commissioning Phase", "Closeout Phase"}
 
+# ── PM Tasks (🧭 PM Tasks todoset) ──────────────────────────────────────────────
+# The "🧭 PM Tasks" todoset is instantiated into every Standard Project from the
+# PM Tasks template. It holds the PM's operating cadence as grouped todolists.
+# Rick reviews these per Standard Project and flags PM risk. Match names by
+# keyword (case-insensitive substring) so emoji/spacing variations don't matter.
+PM_TASKS_TODOSET = "PM Tasks"
+REQUIRED_PM_TASK_GROUPS = ("Setup & Controls", "Weekly Cadence", "Gates & Trips")
+# Legacy "Pre-Onsite Checklist" may still linger inside 🧭 PM Tasks — it's
+# superseded by Gates & Trips. Rick is told to ignore it (see SOP context).
+
 
 def classify_project_type(name):
     """Return 'Design Contract', 'Sales', or 'Standard Project'.
@@ -257,7 +267,7 @@ def fetch_todos_for_project(proj):
     todoset_tools = [d for d in proj.get("dock", [])
                      if d.get("name") == "todoset" and d.get("enabled")]
     if not todoset_tools:
-        return [], [], [], [], False
+        return [], [], [], [], [], False
 
     def _fetch_todoset_lists(ts):
         try:
@@ -276,7 +286,7 @@ def fetch_todos_for_project(proj):
                 t["_todoset_title"] = ts.get("title", "")
             todolists.extend(tl or [])
     if not todolists:
-        return [], [], [], [], fetch_incomplete
+        return [], [], [], [], [], fetch_incomplete
 
     # Each todolist carries its own `visible_to_clients` flag — that's the
     # source of truth. (We previously hit /buckets/{id}/client/recordings.json
@@ -301,6 +311,29 @@ def fetch_todos_for_project(proj):
                         "list": required_name,
                         "issue": "not_client_visible",
                         "app_url": tlist_obj.get("app_url"),
+                    })
+
+    # PM Tasks presence check. The "🧭 PM Tasks" todoset should exist on every
+    # Standard Project (caller gates this to Standard Projects only). Detect from
+    # the authoritative todolist set, not from fetched todos — an all-complete
+    # group would otherwise read as missing once completed todos age out.
+    pm_tasks_issues = []
+    if not fetch_incomplete:
+        pm_lists = [t for t in todolists
+                    if PM_TASKS_TODOSET.lower() in (t.get("_todoset_title") or "").lower()]
+        if not pm_lists:
+            pm_tasks_issues.append({
+                "project": proj_name,
+                "issue": "missing_pm_tasks_list",
+            })
+        else:
+            pm_names = " | ".join(t.get("name", "") for t in pm_lists).lower()
+            for grp in REQUIRED_PM_TASK_GROUPS:
+                if grp.lower() not in pm_names:
+                    pm_tasks_issues.append({
+                        "project": proj_name,
+                        "issue": "missing_pm_task_group",
+                        "group": grp,
                     })
 
     def _fetch_list_todos(tlist):
@@ -331,6 +364,9 @@ def fetch_todos_for_project(proj):
             completed = bool(todo.get("completed"))
             assignees = [a.get("name") for a in todo.get("assignees", [])]
             raw_desc = _re.sub(r'<[^>]+>', ' ', todo.get("description") or "").strip()
+            # PM Tasks gate items carry meaningful instructions in their
+            # description (what to confirm at each gate) — keep more of it.
+            desc_limit = 800 if PM_TASKS_TODOSET.lower() in tlist.get("_todoset_title", "").lower() else 300
             entry = {
                 "project": proj_name,
                 "project_id": proj_id,
@@ -346,7 +382,7 @@ def fetch_todos_for_project(proj):
                 "comments_count": todo.get("comments_count", 0),
                 "assignees": assignees,
                 "app_url": todo.get("app_url"),
-                "description": raw_desc[:300],
+                "description": raw_desc[:desc_limit],
             }
             all_todos.append(entry)
             if any(tag in title for tag in SCHED_TAGS):
@@ -357,7 +393,7 @@ def fetch_todos_for_project(proj):
                 labor_entry = {**entry, "description": raw_desc[:1200]}
                 labor_todos.append(labor_entry)
 
-    return schedule_todos, labor_todos, all_todos, client_visibility_issues, fetch_incomplete
+    return schedule_todos, labor_todos, all_todos, client_visibility_issues, pm_tasks_issues, fetch_incomplete
 
 
 def fetch_messages_for_project(proj):
@@ -801,15 +837,16 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
     # Per-project data
     all_schedule_todos, all_labor_todos, all_todos = [], [], []
     all_messages, all_cards, all_client_visibility_issues = [], [], []
+    all_pm_tasks_issues = []
     project_summaries = []
     projects_to_fetch = sky_projects[:1] if mode == "deep_dive" else sky_projects
 
     def _fetch_project_bundle(proj):
         try:
-            sched_t, labor_t, proj_t, vis, todos_incomplete = fetch_todos_for_project(proj)
+            sched_t, labor_t, proj_t, vis, pm_issues, todos_incomplete = fetch_todos_for_project(proj)
         except Exception as e:
             print(f"_fetch_project_bundle todos failed for {proj['id']}: {type(e).__name__}: {e}")
-            sched_t, labor_t, proj_t, vis, todos_incomplete = [], [], [], [], True
+            sched_t, labor_t, proj_t, vis, pm_issues, todos_incomplete = [], [], [], [], [], True
 
         try:
             msgs = fetch_messages_for_project(proj)
@@ -841,7 +878,7 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
                 sched_entries = []
             for e in sched_entries:
                 e["_project_name"] = proj["name"]
-        return proj, sched_t, labor_t, proj_t, vis, msgs, emails, cards_p, sched_entries, todos_incomplete
+        return proj, sched_t, labor_t, proj_t, vis, pm_issues, msgs, emails, cards_p, sched_entries, todos_incomplete
 
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=PROJECT_FETCH_WORKERS) as pool:
@@ -857,7 +894,7 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
         cutoff_msg = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
         cutoff_done = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
-    for proj, sched_todos, labor_todos, proj_todos, client_vis_issues, messages, email_forwards, cards, sched_entries, fetch_incomplete in bundles:
+    for proj, sched_todos, labor_todos, proj_todos, client_vis_issues, pm_issues, messages, email_forwards, cards, sched_entries, fetch_incomplete in bundles:
         desc = proj.get("description", "")
         proj_type = classify_project_type(proj.get("name", ""))
         project_summaries.append({
@@ -893,6 +930,7 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
         # expected to be SOP-compliant yet.
         if proj_type == "Standard Project":
             all_client_visibility_issues.extend(client_vis_issues)
+            all_pm_tasks_issues.extend(pm_issues)
 
     drive_compliance = audit_drive_for_projects(projects_to_fetch)
 
@@ -907,6 +945,7 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
         "project_summaries": project_summaries,
         "incomplete_fetches": incomplete_fetches,
         "client_visibility_issues": all_client_visibility_issues,
+        "pm_tasks_issues": all_pm_tasks_issues,
         "labor_todos": all_labor_todos,
         "schedule_tagged_todos": all_schedule_todos,
         "upcoming_schedule_entries": schedule_entries,
@@ -1060,6 +1099,55 @@ The data bundle includes a `client_visibility_issues` array. Each entry has `pro
 ### Pre-Mobilization Gate
 GO/NO-GO check required 14 days AND 7 days before mobilization.
 No evidence of GO/NO-GO with [ONS-SCHED] due in <14 days = flag.
+
+### 🧭 PM Tasks (Standard Projects only)
+Every Standard Project carries a **🧭 PM Tasks** todoset — the PM's operating
+cadence, instantiated from the PM Tasks template. It is grouped into todolists:
+- **🧱 Setup & Controls** — one-time setup: recurring ENG+PROC+PM weekly check-in
+  scheduled; punchlist tracker created.
+- **🔁 Weekly Cadence** — repeats weekly: Orders Audit; Internal Weekly Update;
+  Client Weekly Update; Punchlist Aging (anything >14 days needs an escalation
+  plan + scheduled engineer review); Cleanup (close dead threads, link the
+  source-of-truth post/to-do).
+- **🚦 Gates & Trips** — per onsite trip: **Two Weeks Out** (confirm logistics,
+  short-lead items, travel + lodging, how materials/lifts get to site,
+  mobilization meeting), **One Week Out** (confirm date/time and POCs with the
+  client, confirmation meeting), **While Onsite** (open client/Skylark comms,
+  timely problem resolution, agreed reporting cadence), **Post-Trip** (AAR
+  dissemination, update punchlist, determine future ENG engagement, closeout
+  criteria).
+- **🗒️ Parking Lot** — freeform PM notes/reminders. Do NOT flag items here.
+
+Your job: review these per Standard Project and surface **PM risk** — what the PM
+needs to act on now. Cross-reference [ONS-SCHED] trip dates from
+`schedule_tagged_todos` to judge the Gates:
+- An [ONS-SCHED] trip starts in ≤14 days but its **Two Weeks Out** gate is still
+  open → flag (logistics/travel/materials may be unconfirmed).
+- An [ONS-SCHED] trip starts in ≤7 days but its **One Week Out** gate is still
+  open → flag (client may not have confirmed date/POCs).
+- A trip's last [ONS-SCHED] day has passed but **Post-Trip** is still open →
+  flag (AAR / punchlist / closeout follow-up missing).
+- A **Weekly Cadence** item sits open and untouched (`updated_at`) for 7+ days on
+  an active execution project → flag the cadence as slipping (a missing **Client
+  Weekly Update** is the highest-signal one).
+- **Punchlist Aging**: any punchlist item older than 14 days with no escalation
+  plan → flag.
+Only raise a gate once its trigger window has actually arrived, and apply the
+reporting discipline — lead with what IS done, flag proportionally.
+
+The data bundle includes a `pm_tasks_issues` array (Standard Projects only). Each
+entry has `project` and `issue`:
+- `missing_pm_tasks_list` — the project has no 🧭 PM Tasks todoset at all. Flag as
+  "PM Tasks list missing — instantiate from the PM Tasks template."
+- `missing_pm_task_group` (with `group`) — the todoset exists but a required
+  group (Setup & Controls / Weekly Cadence / Gates & Trips) is absent.
+
+IGNORE the legacy **"Pre-Onsite Checklist"** list if it still appears inside a
+project's 🧭 PM Tasks — it is superseded by Gates & Trips. Do not review or flag
+against it.
+
+These PM Tasks checks apply to **Standard Projects only** — never flag PM Tasks
+gaps on Design Contract or (Sales) projects.
 
 ### Required Logistics Todos (Standard Projects with confirmed onsite date)
 Projects can have multiple onsite trips. Each confirmed [ONS-SCHED] todo (with a real due date, not TBD) represents one trip and requires its own complete set of three logistics todos.
