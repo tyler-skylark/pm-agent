@@ -6,6 +6,7 @@ Modes: morning briefing, deep dive, drive audit
 
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -819,6 +820,180 @@ def audit_drive_for_projects(sky_projects):
     return out
 
 
+# ── Slack channel reading (internal per-project conversations) ───────────────────
+# Each active job has a public Slack channel whose name BEGINS with the bare job
+# number, e.g. "2029-lp-royse-city". Some jobs have more than one channel (a main
+# channel plus a "<id>-...-commissioning" channel); a few channels cover two jobs
+# ("1999-2000-thecrossing"). Rick reads the last 14 days of these so internal team
+# chatter informs the briefing. All reads are best-effort: any failure logs and
+# returns empty so the briefing degrades gracefully to Basecamp-only.
+
+SLACK_HISTORY_DAYS = 14
+SLACK_PER_CHANNEL_MSG_CAP = 200
+
+_SLACK_READ_CLIENT = None
+
+
+def get_slack_read_client():
+    global _SLACK_READ_CLIENT
+    if _SLACK_READ_CLIENT is None:
+        client = WebClient(token=os.environ.get("SLACK_TOKEN"))
+        try:
+            from slack_sdk.http_retry.builtin_handlers import (
+                ConnectionErrorRetryHandler,
+                RateLimitErrorRetryHandler,
+            )
+            client.retry_handlers.append(RateLimitErrorRetryHandler(max_retry_count=3))
+            client.retry_handlers.append(ConnectionErrorRetryHandler(max_retry_count=2))
+        except Exception as e:
+            print(f"slack retry handlers unavailable: {type(e).__name__}: {e}")
+        _SLACK_READ_CLIENT = client
+    return _SLACK_READ_CLIENT
+
+
+def _slack_leading_job_ids(channel_name):
+    """Job numbers are the leading hyphen-separated numeric tokens of the channel
+    name. Stop at the first non-numeric token so "1662-clear-creek-east96" -> ['1662']
+    while "1999-2000-thecrossing" -> ['1999', '2000']."""
+    ids = []
+    for tok in (channel_name or "").split("-"):
+        if re.fullmatch(r"\d{3,4}", tok):
+            ids.append(tok)
+        else:
+            break
+    return ids
+
+
+def fetch_slack_channel_map():
+    """Return {job_id: [channel dicts]} for every public channel whose name begins
+    with a 3-4 digit job number. job_id is the bare number, e.g. '2029'."""
+    client = get_slack_read_client()
+    job_map = {}
+    cursor = None
+    try:
+        while True:
+            resp = client.conversations_list(
+                types="public_channel", limit=1000, exclude_archived=True, cursor=cursor)
+            for ch in resp.get("channels", []):
+                for jid in _slack_leading_job_ids(ch.get("name", "")):
+                    job_map.setdefault(jid, []).append(ch)
+            cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+    except Exception as e:
+        print(f"fetch_slack_channel_map failed: {type(e).__name__}: {e}")
+        return {}
+    return job_map
+
+
+def fetch_slack_users():
+    """Return {user_id: display name} for author resolution. Best-effort — names
+    just fall back to raw IDs if this fails."""
+    client = get_slack_read_client()
+    users = {}
+    cursor = None
+    try:
+        while True:
+            resp = client.users_list(limit=1000, cursor=cursor)
+            for u in resp.get("members", []):
+                prof = u.get("profile") or {}
+                users[u["id"]] = (prof.get("real_name") or u.get("real_name")
+                                  or prof.get("display_name") or u.get("name") or u["id"])
+            cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+    except Exception as e:
+        print(f"fetch_slack_users failed: {type(e).__name__}: {e}")
+    return users
+
+
+def _slack_ts_to_iso(ts):
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _clean_slack_text(text, users):
+    """Strip Slack markup to plain text: resolve <@U…> mentions to names, channel
+    refs to #name, and <url|label> links to "label (url)"."""
+    if not text:
+        return ""
+    text = re.sub(r"<@([A-Z0-9]+)(?:\|[^>]+)?>",
+                  lambda m: "@" + users.get(m.group(1), m.group(1)), text)
+    # special mentions: <!channel>, <!here>, <!subteam^S123|@team>
+    text = re.sub(r"<!([^>|]+)(?:\|([^>]+))?>",
+                  lambda m: "@" + (m.group(2) or m.group(1)).lstrip("@"), text)
+    text = re.sub(r"<#[A-Z0-9]+\|([^>]+)>", r"#\1", text)
+    text = re.sub(r"<(https?://[^|>]+)\|([^>]+)>", r"\2 (\1)", text)
+    text = re.sub(r"<(https?://[^>]+)>", r"\1", text)
+    return text.strip()
+
+
+def fetch_slack_messages_for_project(proj, channels, oldest_ts, users):
+    """Read recent messages (incl. thread replies) from the project's Slack
+    channel(s). Auto-joins each public channel so history is readable. Best-effort:
+    a failure on one channel logs and skips, never aborts the project."""
+    client = get_slack_read_client()
+    proj_name = proj["name"]
+    out = []
+    for ch in channels:
+        cid, cname = ch["id"], ch.get("name", "")
+        if not ch.get("is_member"):
+            try:
+                client.conversations_join(channel=cid)
+            except Exception as e:
+                print(f"slack join failed for #{cname} ({proj_name}): {type(e).__name__}: {e}")
+
+        try:
+            msgs, cursor = [], None
+            while len(msgs) < SLACK_PER_CHANNEL_MSG_CAP:
+                resp = client.conversations_history(
+                    channel=cid, oldest=oldest_ts, limit=200, cursor=cursor)
+                msgs.extend(resp.get("messages", []))
+                cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+                if not cursor or not resp.get("has_more"):
+                    break
+        except Exception as e:
+            print(f"slack history failed for #{cname} ({proj_name}): {type(e).__name__}: {e}")
+            continue
+
+        for m in msgs:
+            if m.get("subtype") in ("channel_join", "channel_leave", "channel_topic", "channel_purpose"):
+                continue
+            content = _clean_slack_text(m.get("text"), users)
+            if not content:
+                continue
+            out.append({
+                "project": proj_name,
+                "type": "slack_message",
+                "channel": cname,
+                "author": users.get(m.get("user"), m.get("user") or m.get("username") or "unknown"),
+                "content": content[:600],
+                "created_at": _slack_ts_to_iso(m.get("ts")),
+            })
+            if m.get("reply_count") and m.get("thread_ts"):
+                try:
+                    rresp = client.conversations_replies(
+                        channel=cid, ts=m["thread_ts"], oldest=oldest_ts, limit=100)
+                    for r in rresp.get("messages", [])[1:]:  # [0] is the parent, already added
+                        rc = _clean_slack_text(r.get("text"), users)
+                        if not rc:
+                            continue
+                        out.append({
+                            "project": proj_name,
+                            "type": "slack_reply",
+                            "channel": cname,
+                            "parent_title": _clean_slack_text(m.get("text"), users)[:80],
+                            "author": users.get(r.get("user"), r.get("user") or "unknown"),
+                            "content": rc[:400],
+                            "created_at": _slack_ts_to_iso(r.get("ts")),
+                        })
+                except Exception as e:
+                    print(f"slack replies failed for #{cname} ({proj_name}): {type(e).__name__}: {e}")
+    return out
+
+
 def fetch_basecamp_data(mode="briefing", project_query=None):
     print(f"Fetching Basecamp data (mode={mode})...")
 
@@ -834,10 +1009,19 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
             return {"error": f"No project found matching {project_query}"}
         sky_projects = matched
 
+    # Slack: internal per-project channels (named "<jobid>-..."). Built once,
+    # read concurrently per project below. Best-effort — empty map => no Slack.
+    slack_oldest_ts = str((datetime.now(timezone.utc) - timedelta(days=SLACK_HISTORY_DAYS)).timestamp())
+    slack_job_map = fetch_slack_channel_map()
+    slack_users = fetch_slack_users() if slack_job_map else {}
+    if slack_job_map:
+        print(f"Slack: matched {len(slack_job_map)} job channels, {len(slack_users)} users")
+
     # Per-project data
     all_schedule_todos, all_labor_todos, all_todos = [], [], []
     all_messages, all_cards, all_client_visibility_issues = [], [], []
     all_pm_tasks_issues = []
+    all_slack_messages = []
     project_summaries = []
     projects_to_fetch = sky_projects[:1] if mode == "deep_dive" else sky_projects
 
@@ -878,7 +1062,18 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
                 sched_entries = []
             for e in sched_entries:
                 e["_project_name"] = proj["name"]
-        return proj, sched_t, labor_t, proj_t, vis, pm_issues, msgs, emails, cards_p, sched_entries, todos_incomplete
+
+        slack_msgs = []
+        try:
+            m = re.search(r"SKY-(\d{3,4})", proj.get("name", ""), re.I)
+            chans = slack_job_map.get(m.group(1)) if (m and slack_job_map) else None
+            if chans:
+                slack_msgs = fetch_slack_messages_for_project(proj, chans, slack_oldest_ts, slack_users)
+        except Exception as e:
+            print(f"_fetch_project_bundle slack failed for {proj['id']}: {type(e).__name__}: {e}")
+            slack_msgs = []
+
+        return proj, sched_t, labor_t, proj_t, vis, pm_issues, msgs, emails, cards_p, sched_entries, todos_incomplete, slack_msgs
 
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=PROJECT_FETCH_WORKERS) as pool:
@@ -894,7 +1089,7 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
         cutoff_msg = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
         cutoff_done = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
-    for proj, sched_todos, labor_todos, proj_todos, client_vis_issues, pm_issues, messages, email_forwards, cards, sched_entries, fetch_incomplete in bundles:
+    for proj, sched_todos, labor_todos, proj_todos, client_vis_issues, pm_issues, messages, email_forwards, cards, sched_entries, fetch_incomplete, slack_msgs in bundles:
         desc = proj.get("description", "")
         proj_type = classify_project_type(proj.get("name", ""))
         project_summaries.append({
@@ -924,6 +1119,7 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
         all_messages.extend(messages)
         all_messages.extend(email_forwards)
         all_cards.extend(cards)
+        all_slack_messages.extend(slack_msgs)
         schedule_entries.extend(sched_entries)
         # Visibility flags don't apply to pre-execution projects (Design
         # Contract or Sales) — those use the same template but aren't
@@ -953,6 +1149,9 @@ def fetch_basecamp_data(mode="briefing", project_query=None):
         "cards": all_cards,
         "all_todos": all_todos,
         "messages_and_comments": all_messages,
+        # Internal Slack chatter goes LAST — it's informal supporting context, so
+        # it's the first thing to drop if the bundle hits the truncation limit.
+        "slack_conversations": all_slack_messages,
     }
 
 
@@ -964,7 +1163,7 @@ SKYLARK_SOP_CONTEXT = """
 ### Project Types
 Skylark has three types of SKY- projects:
 - **Design Contract** — pre-execution, design/engineering phase only. Project name includes "(Design Contract)". TBD fields are acceptable. Full SOP compliance (install scheduling, labor, procurement) is NOT expected.
-- **Sales** — pre-contract, large opportunity in sales engineering. Project name includes "(Sales)". Uses the standard project template but most SOPs do NOT apply until contract is signed and the (Sales) tag is removed. The ONLY thing to flag on a (Sales) project is *hanging conversations* — a question or request from the client (or internal team) in `messages_and_comments` that has no reply for 3+ days. Do NOT flag missing schedule, missing labor, missing client visibility, missing dates, or any other SOP item on (Sales) projects.
+- **Sales** — pre-contract, large opportunity in sales engineering. Project name includes "(Sales)". Uses the standard project template but most SOPs do NOT apply until contract is signed and the (Sales) tag is removed. The ONLY things to flag on a (Sales) project are (1) *unanswered client communication* — any client-originated item in `messages_and_comments` without a substantive Skylark reply within 24 hours, and (2) *hanging internal conversations* — an internal ask silent for 3+ days. Do NOT flag missing schedule, missing labor, missing client visibility, missing dates, or any other SOP item on (Sales) projects.
 - **Standard Project** — full execution project. All description fields required, no TBDs, full SOP applies.
 
 ### Project Description (Required Fields)
@@ -1413,25 +1612,39 @@ def analyze_with_claude(anthropic_client, data_bundle):
 
 Today is {data_bundle['as_of'][:10]}.
 
-The data below includes EVERY active SKY project with ALL todos (all_todos), ALL messages and comments (messages_and_comments), ALL cards (cards), `upcoming_schedule_entries` (Basecamp Schedule dock — events/calendar entries), labor todos, AND `drive_compliance` (Google Drive job folder audit per project). Use all of it. Drive is a primary data source — not optional context.
+The data below includes EVERY active SKY project with ALL todos (all_todos), ALL messages and comments (messages_and_comments), ALL cards (cards), `upcoming_schedule_entries` (Basecamp Schedule dock — events/calendar entries), labor todos, `drive_compliance` (Google Drive job folder audit per project), AND `slack_conversations` — the last 14 days of each job's INTERNAL Slack channel (named with the job number, e.g. `2029-lp-royse-city`). Use all of it. Drive is a primary data source — not optional context.
+
+Internal Slack (`slack_conversations`): the team's informal back-channel per job. Each item has `project`, `channel`, `author`, `content`, `created_at`; threaded replies appear as `slack_reply` with a `parent_title`. Treat Slack as supporting signal, NOT a system of record:
+- Surface concrete blockers, decisions, commitments, and open questions raised in Slack that affect a job's status — especially anything that contradicts or isn't reflected in Basecamp or the schedule.
+- When Slack and Basecamp disagree (e.g. a date or scope discussed in Slack but not in the schedule/todos), flag the gap.
+- The hanging-conversation rule below applies to Slack too, but use judgment: casual chatter going quiet is normal; a specific unanswered ask that's blocking work is not. Never flag banter, reactions, emoji, or already-resolved threads.
+- Summarize — never quote Slack verbatim at length.
 
 Review all active project data and produce the briefing.
 
 Project type rules (apply per-project before flagging):
 - **Standard Project** — full SOP applies. All sections below apply.
-- **Design Contract** — pre-execution. Skip install/labor/visibility/schedule-tag SOP checks. Flag only: missing description fields, hanging conversations, or stalled engineering with no recent activity.
-- **Sales** — pre-contract opportunity in sales engineering. Apply ONLY the hanging-conversation rule below. Do NOT flag missing schedule, missing labor, missing client visibility, missing dates, or any other SOP item. Sales projects don't have an install yet — silence on those is normal.
+- **Design Contract** — pre-execution. Skip install/labor/visibility/schedule-tag SOP checks. Flag only: missing description fields, unanswered client comms (>24h), hanging internal conversations (3+ days), or stalled engineering with no recent activity.
+- **Sales** — pre-contract opportunity in sales engineering. Apply ONLY the client-communication and hanging-conversation rules below. Do NOT flag missing schedule, missing labor, missing client visibility, missing dates, or any other SOP item. Sales projects don't have an install yet — silence on those is normal.
 
-Hanging conversation rule (applies to ALL three project types): a question or request from the client OR an internal teammate in `messages_and_comments` that has no reply for 3+ days is "hanging." Cite the parent_title and the asker. Skip if a later comment in the same thread answers it.
+Client communication rule (applies to ALL three project types — top priority): identify every client-originated item in `messages_and_comments`. That means every entry of type `email_forward` (external senders by construction — Basecamp's inbox is where outside emails land) plus any message-board post or comment whose author matches the project's Client Contact or is otherwise clearly non-Skylark. Any client-originated question, request, or ask WITHOUT a substantive reply from a Skylark teammate within 24 hours = flag `:red_circle:`. This overrides the 3-day hanging rule for client items — clients get a response inside 24h, period. Cite the project, asker/from, subject or parent_title, and hours open. Skip only if a Skylark reply in the same thread substantively addresses it.
+
+Hanging conversation rule (internal only, applies to ALL three project types): a question or request from an internal teammate in `messages_and_comments` (or a blocking, unanswered ask in `slack_conversations`) that has no reply for 3+ days is "hanging." Cite the parent_title/channel and the asker. Skip if a later comment in the same thread answers it.
 
 Structure:
-1. *One-line summary* — e.g. `47 active jobs — 5 need attention, 1 fetch incomplete`
-2. *Needs attention* — jobs with real issues (each with `:red_circle:` or `:large_yellow_circle:`, specific todo/person/date)
-3. *Data fetch incomplete* (only if `incomplete_fetches` is non-empty) — list those projects, do NOT analyze them
-4. *Sales watch* (only if any (Sales) projects exist) — for each (Sales) project: `:white_check_mark:` if no hanging conversation, `:large_yellow_circle:` if there is one (cite parent_title, asker, age in days). Nothing else.
-5. *All clear* — `:white_check_mark:` per project, name + current phase, one short line each
-6. *Drive Health* — projects with missing top-level folders, empty required folders, `no_drive_folder_found`, or `drive_folder_outside_jobs_root`. Use the `tree` to avoid false positives (alias matches, signed contracts in Contract Revisions/Signed Documents, etc.). Render Drive folder as `<DRIVE_URL|Drive>`.
-7. *This Week* — milestones due in the next 7 days across all jobs (Standard Projects only — Sales/Design Contract milestones aren't tracked here)
+1. *One-line summary* — e.g. `47 active jobs — 5 need attention, 2 client asks awaiting reply, 1 fetch incomplete`
+2. *Client comms* — every client-originated ask across all projects without a substantive Skylark reply inside 24h. `:red_circle:` per item with project, asker/from, subject/parent_title, and hours open. If everything's answered, one line: `:white_check_mark: No open client asks.` This section runs first — clients come first.
+3. *PM Tasks* — grouped by Skylark PM (from each project's description). One line per PM covering their Standard-Project portfolio. Status:
+   - `:red_circle:` if ANY Gates & Trips window has arrived unmet — Two Weeks Out gate still open with an [ONS-SCHED] trip due in ≤14 days, One Week Out gate still open with a trip due in ≤7 days, or Post-Trip gate still open after a trip's last onsite day has passed. Also `:red_circle:` on any `pm_tasks_issues` entry (missing 🧭 PM Tasks list or a required group) under that PM.
+   - `:large_yellow_circle:` if any Weekly Cadence item is slipping (7+ days untouched on an active execution project — Client Weekly Update is the highest signal) or Punchlist Aging (>14 days without a documented escalation plan).
+   - `:white_check_mark:` if the PM is current across their portfolio.
+   Name the PM, cite the specific project + gate/cadence item that's slipping (project name, trip date, days open). Standard Projects only — do NOT roll up Sales or Design Contract projects into this section.
+4. *Needs attention* — jobs with real issues (each with `:red_circle:` or `:large_yellow_circle:`, specific todo/person/date)
+5. *Data fetch incomplete* (only if `incomplete_fetches` is non-empty) — list those projects, do NOT analyze them
+6. *Sales watch* (only if any (Sales) projects exist) — for each (Sales) project: `:white_check_mark:` if no open client ask and no hanging internal conversation; `:red_circle:` if an open client ask (cite parent_title, asker, hours open); `:large_yellow_circle:` if an internal hanging conversation (cite parent_title, asker, age in days).
+7. *All clear* — `:white_check_mark:` per project, name + current phase, one short line each
+8. *Drive Health* — projects with missing top-level folders, empty required folders, `no_drive_folder_found`, or `drive_folder_outside_jobs_root`. Use the `tree` to avoid false positives (alias matches, signed contracts in Contract Revisions/Signed Documents, etc.). Render Drive folder as `<DRIVE_URL|Drive>`.
+9. *This Week* — milestones due in the next 7 days across all jobs (Standard Projects only — Sales/Design Contract milestones aren't tracked here)
 
 Severity emoji: `:red_circle:` for high, `:large_yellow_circle:` for medium, `:white_check_mark:` for clear.
 
@@ -1460,7 +1673,7 @@ Severity emoji: `:red_circle:` for high, `:large_yellow_circle:` for medium, `:w
 
 As of {data_bundle['as_of'][:10]}.
 
-The data below includes EVERY todo, message, comment, card, and schedule entry for this project. Use all of it — don't skip anything.
+The data below includes EVERY todo, message, comment, card, and schedule entry for this project, plus `slack_conversations` — the last 14 days of the job's internal Slack channel(s). Use all of it — don't skip anything.
 
 Cover (each as its own `*Section*` line):
 1. Project description fields (PM, Engineer, On-Site Lead, Client Contact)
@@ -1469,10 +1682,18 @@ Cover (each as its own `*Section*` line):
 4. Upcoming milestones (next 30 days)
 5. Labor/travel status (any [LABOR] todos and their travel details)
 6. Card table status (if present — what's in each column, anything blocked or stale)
-7. Full message/comment thread review — tone, open questions, anything unresolved
-8. Any SOP violations or engineering milestone flags
-9. Drive folder review — use `drive_compliance`. Confirm the resolved `drive_path`, link the `drive_url` as `<DRIVE_URL|Drive folder>`, call out missing/empty required folders, stale activity, or "Damaged Product"-style sub-folders that hint at incidents. Use the `tree` to spot real evidence. Cross-reference Drive activity against Basecamp phase.
-10. Overall health: `:large_green_circle: GREEN` / `:large_yellow_circle: YELLOW` / `:red_circle: RED` with one-line reason
+7. PM Tasks status (Standard Projects only — skip on Sales/Design Contract) — the 🧭 PM Tasks todoset:
+   - *Setup & Controls* — recurring ENG+PROC+PM weekly check-in scheduled? Punchlist tracker created?
+   - *Weekly Cadence* — for each item (Orders Audit, Internal Weekly Update, Client Weekly Update, Punchlist Aging, Cleanup): current vs untouched >7 days? Call out Client Weekly Update state explicitly.
+   - *Gates & Trips* — per [ONS-SCHED] trip, status of Two Weeks Out / One Week Out / While Onsite / Post-Trip against the trip date. Flag `:red_circle:` on any gate whose trigger window has arrived and is still open.
+   - *Punchlist Aging* — any items open >14 days without a documented escalation plan.
+   - Surface any `pm_tasks_issues` entry for this project (missing 🧭 PM Tasks list or missing required group).
+8. Message/comment thread review, in two parts:
+   (a) *Client communication* — every client-originated item (all `email_forward` entries plus posts/comments authored by the project's Client Contact or any non-Skylark author). For each: subject, asker/from, when raised, and Skylark's response status. Flag `:red_circle:` on any client ask open >24h without a substantive Skylark reply — clients come first.
+   (b) *Internal threads* — tone, open questions, anything unresolved. Fold in `slack_conversations` (internal Slack): surface blockers, decisions, and unanswered asks raised there, and flag anything discussed in Slack that isn't reflected in Basecamp/the schedule. Summarize — don't quote at length.
+9. Any SOP violations or engineering milestone flags
+10. Drive folder review — use `drive_compliance`. Confirm the resolved `drive_path`, link the `drive_url` as `<DRIVE_URL|Drive folder>`, call out missing/empty required folders, stale activity, or "Damaged Product"-style sub-folders that hint at incidents. Use the `tree` to spot real evidence. Cross-reference Drive activity against Basecamp phase.
+11. Overall health: `:large_green_circle: GREEN` / `:large_yellow_circle: YELLOW` / `:red_circle: RED` with one-line reason
 
 Be thorough — Tyler wants the full picture.
 
